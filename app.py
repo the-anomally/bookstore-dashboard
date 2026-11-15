@@ -583,7 +583,7 @@ with tab_books:
                       (book_to_delete[0],),
                   )
               st.rerun()
-               except psycopg.errors.ForeignKeyViolation:st.error(
+              except psycopg.errors.ForeignKeyViolation:st.error(
                   "This rental is referenced in rental_logs. Tick the second"
                   " box above to remove its linked log entry as well."
               )
