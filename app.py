@@ -629,7 +629,7 @@ with tab_books:
                       (book_to_delete[0],),
                   )
               st.rerun()
-            except psycopg.errors.ForeignKeyViolation:
+              except psycopg.errors.ForeignKeyViolation:
               st.error(
                   "Cannot delete this book because it still has rental records."
                   " Delete its rentals first."
