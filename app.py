@@ -103,20 +103,31 @@ def render_add_row_form(table_name, form_key, button_label):
           st.error(f"Could not save record: {e}")
 
 
-# Load current books, customers, and active unreturned rentals
+# Load books, customers, and all rentals
 book_rows, books_data = fetch_table("SELECT * FROM books ORDER BY book_id;")
 customer_rows, customers_data = fetch_table(
     "SELECT * FROM customers ORDER BY customer_id;"
 )
-active_rentals, _ = fetch_table("""
-    SELECT rental_id, book_id, customer_id, borrow_date
+all_rentals, _ = fetch_table("""
+    SELECT rental_id, book_id, customer_id, borrow_date, return_date
     FROM rentals
-    WHERE return_date IS NULL
     ORDER BY rental_id DESC;
     """)
 
+active_rentals = [r for r in all_rentals if r[4] is None]
+returned_count = len(all_rentals) - len(active_rentals)
+
 book_names = {r[0]: r[1] for r in book_rows}
 customer_names = {r[0]: r[1] for r in customer_rows}
+
+# --- KPI SUMMARY METRICS ---
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("Total Books", len(book_rows))
+m2.metric("Total Customers", len(customer_rows))
+m3.metric("Active Rentals", len(active_rentals))
+m4.metric("Returned Rentals", returned_count)
+
+st.divider()
 
 # --- SECTION 1: Check Out & Return Forms Side by Side ---
 col_checkout, col_return = st.columns(2)
@@ -171,7 +182,7 @@ with col_return:
   else:
     st.info("No active unreturned rentals right now.")
 
-# --- SECTION 2: Database Explorer & Inventory Forms ---
+# --- SECTION 2: Database Explorer, Search & Delete Controls ---
 st.subheader("Database Explorer")
 tab_rentals, tab_books, tab_customers, tab_logs = st.tabs(
     ["Live Rentals (View)", "Books", "Customers", "Audit Logs (Trigger)"]
@@ -181,15 +192,139 @@ with tab_rentals:
   _, rentals_data = fetch_table(
       "SELECT * FROM rental_details ORDER BY rental_id DESC;"
   )
-  st.dataframe(rentals_data, hide_index=True, use_container_width=True)
+
+  search_term = (
+      st.text_input(
+          "Search Rentals",
+          placeholder="Filter by book title, customer name, date, or ID...",
+      )
+      .strip()
+      .lower()
+  )
+  if search_term:
+    filtered_rentals = [
+        row
+        for row in rentals_data
+        if any(search_term in str(val).lower() for val in row.values())
+    ]
+  else:
+    filtered_rentals = rentals_data
+
+  st.dataframe(filtered_rentals, hide_index=True, use_container_width=True)
+
+  if all_rentals:
+    with st.expander("Delete a Rental Record"):
+      with st.form("delete_rental_form"):
+        rental_to_delete = st.selectbox(
+            "Select Rental to Delete",
+            all_rentals,
+            format_func=lambda r: (
+                f"Rental #{r[0]}: {book_names.get(r[1], f'Book #{r[1]}')} —"
+                f" {customer_names.get(r[2], f'Customer #{r[2]}')} (Borrowed"
+                f" {r[3]} | {'Active' if r[4] is None else f'Returned {r[4]}'})"
+            ),
+        )
+        confirm_rental_del = st.checkbox(
+            "Confirm permanent deletion of this rental record"
+        )
+        remove_linked_logs = st.checkbox(
+            "Also remove linked audit log entries if required by database"
+            " constraints"
+        )
+        if st.form_submit_button("Delete Rental", type="primary"):
+          if not confirm_rental_del:
+            st.warning("Please tick the confirmation box first.")
+          else:
+            try:
+              with psycopg.connect(DB_URL) as conn:
+                with conn.cursor() as cur:
+                  if remove_linked_logs:
+                    cur.execute(
+                        "DELETE FROM rental_logs WHERE rental_id = %s;",
+                        (rental_to_delete[0],),
+                    )
+                  cur.execute(
+                      "DELETE FROM rentals WHERE rental_id = %s;",
+                      (rental_to_delete[0],),
+                  )
+              st.rerun()
+            except psycopg.errors.ForeignKeyViolation:
+              st.error(
+                  "This rental is referenced in rental_logs. Tick the second"
+                  " box above to remove its linked log entry as well."
+              )
+            except Exception as e:
+              st.error(f"Could not delete rental: {e}")
 
 with tab_books:
   render_add_row_form("books", "add_book_form", "Add New Book")
   st.dataframe(books_data, hide_index=True, use_container_width=True)
 
+  if book_rows:
+    with st.expander("Delete a Book"):
+      with st.form("delete_book_form"):
+        book_to_delete = st.selectbox(
+            "Select Book to Delete",
+            book_rows,
+            format_func=lambda r: f"{r[0]} - {r[1]}",
+        )
+        confirm_book_del = st.checkbox(
+            "Confirm permanent deletion of this book"
+        )
+        if st.form_submit_button("Delete Book", type="primary"):
+          if not confirm_book_del:
+            st.warning("Please tick the confirmation box first.")
+          else:
+            try:
+              with psycopg.connect(DB_URL) as conn:
+                with conn.cursor() as cur:
+                  cur.execute(
+                      "DELETE FROM books WHERE book_id = %s;",
+                      (book_to_delete[0],),
+                  )
+              st.rerun()
+            except psycopg.errors.ForeignKeyViolation:
+              st.error(
+                  "Cannot delete this book because it still has rental records."
+                  " Delete its rentals first."
+              )
+            except Exception as e:
+              st.error(f"Could not delete book: {e}")
+
 with tab_customers:
   render_add_row_form("customers", "add_customer_form", "Add New Customer")
   st.dataframe(customers_data, hide_index=True, use_container_width=True)
+
+  if customer_rows:
+    with st.expander("Delete a Customer"):
+      with st.form("delete_customer_form"):
+        customer_to_delete = st.selectbox(
+            "Select Customer to Delete",
+            customer_rows,
+            format_func=lambda r: f"{r[0]} - {r[1]}",
+        )
+        confirm_cust_del = st.checkbox(
+            "Confirm permanent deletion of this customer"
+        )
+        if st.form_submit_button("Delete Customer", type="primary"):
+          if not confirm_cust_del:
+            st.warning("Please tick the confirmation box first.")
+          else:
+            try:
+              with psycopg.connect(DB_URL) as conn:
+                with conn.cursor() as cur:
+                  cur.execute(
+                      "DELETE FROM customers WHERE customer_id = %s;",
+                      (customer_to_delete[0],),
+                  )
+              st.rerun()
+            except psycopg.errors.ForeignKeyViolation:
+              st.error(
+                  "Cannot delete this customer because they still have rental"
+                  " records. Delete their rentals first."
+              )
+            except Exception as e:
+              st.error(f"Could not delete customer: {e}")
 
 with tab_logs:
   _, logs_data = fetch_table("SELECT * FROM rental_logs ORDER BY log_id DESC;")
