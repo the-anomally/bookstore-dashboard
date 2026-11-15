@@ -881,3 +881,5 @@ with tab_logs:
         file_name=f"rental_audit_logs_{today}.csv",
         mime="text/csv",
         disabled=not logs_data,
+
+    )
