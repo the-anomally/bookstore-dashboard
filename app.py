@@ -1,7 +1,15 @@
 import csv
 from datetime import date, timedelta
+from email.message import EmailMessage
+import hashlib
 import hmac
 import io
+import json
+import os
+import smtplib
+import ssl
+import urllib.parse
+import urllib.request
 import psycopg
 from psycopg import sql
 import streamlit as st
@@ -30,12 +38,187 @@ def to_csv_bytes(dict_rows):
     return output.getvalue().encode("utf-8")
 
 
-# Ensure schema extensions, reservations table, and late-fee settings exist
+# --- PASSWORD HASHING HELPERS (INDIVIDUAL CUSTOMER ACCOUNTS) ---
+def hash_password(plain_password):
+    salt = os.urandom(16)
+    dk = hashlib.pbkdf2_hmac("sha256", plain_password.encode("utf-8"), salt, 100_000)
+    return f"{salt.hex()}:{dk.hex()}"
+
+
+def verify_password(plain_password, stored_hash):
+    if not stored_hash or ":" not in stored_hash:
+        return False
+    salt_hex, dk_hex = stored_hash.split(":", 1)
+    salt = bytes.fromhex(salt_hex)
+    expected_dk = bytes.fromhex(dk_hex)
+    actual_dk = hashlib.pbkdf2_hmac("sha256", plain_password.encode("utf-8"), salt, 100_000)
+    return hmac.compare_digest(actual_dk, expected_dk)
+
+
+# --- OPEN LIBRARY ISBN BARCODE LOOKUP ---
+def lookup_isbn_metadata(raw_isbn):
+    cleaned = "".join(ch for ch in raw_isbn if ch.isalnum()).upper()
+    if not cleaned:
+        return None, "Please scan or enter an ISBN first."
+    url = f"https://openlibrary.org/api/books?bibkeys=ISBN:{cleaned}&format=json&jscmd=data"
+    req = urllib.request.Request(url, headers={"User-Agent": "BookstoreCloudPortal/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        book_info = payload.get(f"ISBN:{cleaned}")
+        if not book_info:
+            return None, f"No Open Library record found for ISBN {cleaned}."
+        title = book_info.get("title", "")
+        if book_info.get("subtitle"):
+            title = f"{title}: {book_info['subtitle']}"
+        authors = ", ".join(a.get("name", "") for a in book_info.get("authors", []) if a.get("name"))
+        publishers = ", ".join(p.get("name", "") for p in book_info.get("publishers", []) if p.get("name"))
+        return {
+            "isbn": cleaned,
+            "title": title,
+            "author": authors,
+            "publisher": publishers,
+        }, None
+    except Exception as e:
+        return None, f"ISBN lookup failed: {e}"
+
+
+# --- PRINTABLE PDF RECEIPT GENERATOR (PURE PYTHON PDF 1.4) ---
+def build_receipt_pdf(receipt_data):
+    def pdf_escape(val):
+        s = str(val).encode("latin-1", "replace").decode("latin-1")
+        return s.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+
+    lines = [
+        ("F2", 16, 50, 775, "BOOKSTORE CLOUD PORTAL"),
+        ("F1", 11, 50, 755, f"OFFICIAL {receipt_data['type'].upper()} RECEIPT"),
+        ("F1", 10, 50, 730, f"Receipt No: #{receipt_data['receipt_no']}    Issued Date: {receipt_data['issued_date']}"),
+        ("F1", 10, 50, 714, "-" * 74),
+        ("F2", 11, 50, 692, "CUSTOMER DETAILS"),
+        ("F1", 10, 50, 676, f"Customer: {receipt_data['customer_name']} (ID #{receipt_data['customer_id']})"),
+        ("F2", 11, 50, 650, "BOOK & RENTAL SUMMARY"),
+        ("F1", 10, 50, 634, f"Rental ID: #{receipt_data['rental_id']}"),
+        ("F1", 10, 50, 618, f"Book Title: {receipt_data['book_title']} (Book ID #{receipt_data['book_id']})"),
+        ("F1", 10, 50, 602, f"Borrow Date: {receipt_data['borrow_date']}"),
+        ("F1", 10, 50, 586, f"Due Date: {receipt_data['due_date']}"),
+        ("F1", 10, 50, 570, f"Return Date: {receipt_data['return_date']}"),
+        ("F1", 10, 50, 554, f"Status: {receipt_data['status']}"),
+        ("F1", 10, 50, 534, "-" * 74),
+        ("F2", 12, 50, 514, f"Late Fee Balance / Paid: {receipt_data['currency']} {receipt_data['late_fee']:,.2f}"),
+        ("F1", 9, 50, 480, "Thank you for reading with us. Please retain this receipt for your records."),
+    ]
+    stream_cmds = [
+        f"BT /{font} {size} Tf {x} {y} Td ({pdf_escape(text)}) Tj ET"
+        for font, size, x, y, text in lines
+    ]
+    stream_bytes = "\n".join(stream_cmds).encode("latin-1")
+
+    objects = [
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+        (
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 842] "
+            b"/Resources << /Font << /F1 4 0 R /F2 5 0 R >> >> /Contents 6 0 R >>\nendobj\n"
+        ),
+        b"4 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
+        b"5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>\nendobj\n",
+        (
+            f"6 0 obj\n<< /Length {len(stream_bytes)} >>\nstream\n".encode("latin-1")
+            + stream_bytes
+            + b"\nendstream\nendobj\n"
+        ),
+    ]
+
+    pdf = bytearray(b"%PDF-1.4\n")
+    offsets = [0]
+    for obj in objects:
+        offsets.append(len(pdf))
+        pdf.extend(obj)
+
+    xref_offset = len(pdf)
+    pdf.extend(f"xref\n0 {len(objects) + 1}\n".encode("latin-1"))
+    pdf.extend(b"0000000000 65535 f \n")
+    for off in offsets[1:]:
+        pdf.extend(f"{off:010d} 00000 n \n".encode("latin-1"))
+
+    pdf.extend(
+        (
+            f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\n"
+            f"startxref\n{xref_offset}\n%%EOF\n"
+        ).encode("latin-1")
+    )
+    return bytes(pdf)
+
+
+# --- EMAIL (GMAIL SMTP) & SMS (AFRICA'S TALKING) REMINDERS ---
+def send_email_reminder(to_email, subject, body_text):
+    smtp_email = st.secrets.get("SMTP_EMAIL")
+    smtp_pass = st.secrets.get("SMTP_APP_PASSWORD")
+    if not smtp_email or not smtp_pass:
+        return False, "Missing SMTP_EMAIL or SMTP_APP_PASSWORD in Streamlit Secrets."
+    if not to_email:
+        return False, "Customer has no email address on file."
+    try:
+        msg = EmailMessage()
+        msg["Subject"] = subject
+        msg["From"] = smtp_email
+        msg["To"] = to_email
+        msg.set_content(body_text)
+        context = ssl.create_default_context()
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context, timeout=10) as server:
+            server.login(smtp_email, smtp_pass)
+            server.send_message(msg)
+        return True, f"Email sent to {to_email}"
+    except Exception as e:
+        return False, f"Email failed: {e}"
+
+
+def send_sms_reminder(phone_number, message_text):
+    at_user = st.secrets.get("AT_USERNAME")
+    at_key = st.secrets.get("AT_API_KEY")
+    at_sender = st.secrets.get("AT_SENDER_ID", "")
+    if not at_user or not at_key:
+        return False, "Missing AT_USERNAME or AT_API_KEY in Streamlit Secrets."
+    if not phone_number:
+        return False, "Customer has no phone number on file."
+    endpoint = (
+        "https://api.sandbox.africastalking.com/version1/messaging"
+        if at_user.lower() == "sandbox"
+        else "https://api.africastalking.com/version1/messaging"
+    )
+    form_fields = {"username": at_user, "to": phone_number, "message": message_text}
+    if at_sender:
+        form_fields["from"] = at_sender
+    data = urllib.parse.urlencode(form_fields).encode("utf-8")
+    req = urllib.request.Request(
+        endpoint,
+        data=data,
+        headers={
+            "apiKey": at_key,
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+        return True, f"SMS queued to {phone_number}: {result.get('SMSMessageData', {}).get('Message', 'Sent')}"
+    except Exception as e:
+        return False, f"SMS failed: {e}"
+
+
+# Ensure schema extensions, customer auth columns, reservations, and settings exist
 with psycopg.connect(DB_URL) as conn:
     with conn.cursor() as cur:
         cur.execute("ALTER TABLE rentals ADD COLUMN IF NOT EXISTS return_date DATE;")
         cur.execute("ALTER TABLE rentals ADD COLUMN IF NOT EXISTS due_date DATE;")
         cur.execute("ALTER TABLE books ADD COLUMN IF NOT EXISTS stock INTEGER NOT NULL DEFAULT 1;")
+        cur.execute("ALTER TABLE books ADD COLUMN IF NOT EXISTS isbn TEXT;")
+        cur.execute("ALTER TABLE books ADD COLUMN IF NOT EXISTS author TEXT;")
+        cur.execute("ALTER TABLE books ADD COLUMN IF NOT EXISTS publisher TEXT;")
+        cur.execute("ALTER TABLE customers ADD COLUMN IF NOT EXISTS email TEXT;")
+        cur.execute("ALTER TABLE customers ADD COLUMN IF NOT EXISTS phone TEXT;")
+        cur.execute("ALTER TABLE customers ADD COLUMN IF NOT EXISTS password_hash TEXT;")
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS reservations (
@@ -72,7 +255,7 @@ def get_editable_columns(table_name, id_col):
         FROM information_schema.columns
         WHERE table_schema = 'public'
           AND table_name = %s
-          AND column_name != %s
+          AND column_name NOT IN (%s, 'password_hash')
           AND (column_default IS NULL OR column_name = 'stock')
         ORDER BY ordinal_position;
         """,
@@ -81,52 +264,69 @@ def get_editable_columns(table_name, id_col):
     return col_rows
 
 
-def render_field_input(col_name, data_type, current_val=None):
+def render_field_input(col_name, data_type, current_val=None, widget_key=None):
     label = col_name.replace("_", " ").title()
     if data_type in ("integer", "bigint", "smallint"):
         default_int = int(current_val) if current_val is not None else (1 if col_name == "stock" else 0)
-        return st.number_input(label, step=1, min_value=0 if col_name == "stock" else None, value=default_int)
+        return st.number_input(
+            label,
+            step=1,
+            min_value=0 if col_name == "stock" else None,
+            value=default_int,
+            key=widget_key,
+        )
     elif data_type in ("numeric", "decimal", "real", "double precision"):
         default_float = float(current_val) if current_val is not None else 0.0
-        return st.number_input(label, step=0.01, value=default_float)
+        return st.number_input(label, step=0.01, value=default_float, key=widget_key)
     elif data_type == "date":
         default_date = current_val if current_val is not None else date.today()
-        return st.date_input(label, value=default_date)
+        return st.date_input(label, value=default_date, key=widget_key)
     elif data_type == "boolean":
         default_bool = bool(current_val) if current_val is not None else False
-        return st.checkbox(label, value=default_bool)
+        return st.checkbox(label, value=default_bool, key=widget_key)
     else:
         default_str = str(current_val) if current_val is not None else ""
-        text_val = st.text_input(label, value=default_str)
+        text_val = st.text_input(label, value=default_str, key=widget_key)
         return text_val.strip() if text_val.strip() else None
 
 
-def render_add_row_form(table_name, id_col, form_key, button_label):
+def render_add_row_form(table_name, id_col, form_key, button_label, prefill=None):
     col_rows = get_editable_columns(table_name, id_col)
-    with st.expander(f"+ {button_label}"):
-        with st.form(form_key, clear_on_submit=True):
-            values = {
-                col_name: render_field_input(col_name, data_type)
-                for col_name, data_type in col_rows
-            }
-            if st.form_submit_button(button_label):
-                try:
-                    cols = list(values.keys())
-                    query = sql.SQL("INSERT INTO {} ({}) VALUES ({});").format(
-                        sql.Identifier(table_name),
-                        sql.SQL(", ").join(map(sql.Identifier, cols)),
-                        sql.SQL(", ").join(sql.Placeholder() * len(cols)),
-                    )
-                    with psycopg.connect(DB_URL) as conn:
-                        with conn.cursor() as cur:
-                            cur.execute(query, [values[c] for c in cols])
-                    st.success(f"{button_label} successful!")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Could not save record: {e}")
+    prefill = prefill or {}
+    with st.form(form_key, clear_on_submit=True):
+        values = {}
+        for col_name, data_type in col_rows:
+            default_override = None
+            if col_name in ("title", "book_title", "name") and prefill.get("title"):
+                default_override = prefill["title"]
+            elif col_name in prefill and prefill[col_name]:
+                default_override = prefill[col_name]
+            values[col_name] = render_field_input(
+                col_name,
+                data_type,
+                current_val=default_override,
+                widget_key=f"{form_key}{col_name}{prefill.get('isbn', 'blank')}",
+            )
+        if st.form_submit_button(button_label):
+            try:
+                cols = list(values.keys())
+                query = sql.SQL("INSERT INTO {} ({}) VALUES ({});").format(
+                    sql.Identifier(table_name),
+                    sql.SQL(", ").join(map(sql.Identifier, cols)),
+                    sql.SQL(", ").join(sql.Placeholder() * len(cols)),
+                )
+                with psycopg.connect(DB_URL) as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(query, [values[c] for c in cols])
+                if table_name == "books" and "isbn_prefill" in st.session_state:
+                    st.session_state["isbn_prefill"] = {}
+                st.success(f"{button_label} successful!")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Could not save record: {e}")
 
 
-# --- DUAL-ROLE LOGIN GATE (STAFF vs CUSTOMER) ---
+# --- DUAL-ROLE LOGIN GATE (STAFF vs INDIVIDUAL CUSTOMER ACCOUNTS) ---
 if "role" not in st.session_state:
     st.session_state["role"] = None
 if "customer_user" not in st.session_state:
@@ -151,43 +351,95 @@ def require_login():
                     st.error("Incorrect staff password.")
 
     with tab_cust_login:
-        customer_pass = st.secrets.get("CUSTOMER_PASSWORD", "bookstore123")
         with st.form("customer_login_form"):
-            cust_identifier = st.text_input("Your Full Name or Customer ID").strip()
-            entered_cust_pass = st.text_input("Customer Portal Password", type="password")
+            cust_identifier = st.text_input("Full Name, Email, or Customer ID").strip()
+            entered_cust_pass = st.text_input("Your Personal Password", type="password")
+            first_time_claim = st.checkbox(
+                "First-time login (set this password if staff created my profile)"
+            )
             if st.form_submit_button("Log In as Customer"):
-                if not cust_identifier:
-                    st.warning("Please enter your name or Customer ID.")
-                elif not hmac.compare_digest(entered_cust_pass, customer_pass):
-                    st.error("Incorrect customer portal password.")
+                if not cust_identifier or not entered_cust_pass:
+                    st.warning("Please enter both your account identifier and password.")
                 else:
-                    cust_rows, _ = fetch_table("SELECT * FROM customers ORDER BY customer_id;")
-                    matched_customer = next(
+                    _, cust_dicts = fetch_table("SELECT * FROM customers ORDER BY customer_id;")
+                    matched = next(
                         (
-                            r
-                            for r in cust_rows
-                            if str(r[0]) == cust_identifier
-                            or str(r[1]).strip().lower() == cust_identifier.lower()
+                            c
+                            for c in cust_dicts
+                            if str(c.get("customer_id")) == cust_identifier
+                            or str(c.get("name", "")).strip().lower() == cust_identifier.lower()
+                            or (
+                                c.get("email")
+                                and str(c.get("email")).strip().lower() == cust_identifier.lower()
+                            )
                         ),
                         None,
                     )
-                    if matched_customer:
+                    if not matched:
+                        st.error("Account not found. Check your spelling or register below.")
+                    elif matched.get("password_hash") is None:
+                        if first_time_claim:
+                            if len(entered_cust_pass) < 4:
+                                st.warning("Please choose a password with at least 4 characters.")
+                            else:
+                                new_hash = hash_password(entered_cust_pass)
+                                with psycopg.connect(DB_URL) as conn:
+                                    with conn.cursor() as cur:
+                                        cur.execute(
+                                            "UPDATE customers SET password_hash = %s WHERE customer_id = %s;",
+                                            (new_hash, matched["customer_id"]),
+                                        )
+                                st.session_state["role"] = "customer"
+                                st.session_state["customer_user"] = {
+                                    "id": matched["customer_id"],
+                                    "name": matched.get("name", f"Customer #{matched['customer_id']}"),
+                                }
+                                st.rerun()
+                        else:
+                            st.info(
+                                "Your profile does not have a personal password yet. "
+                                "Tick 'First-time login' above and submit to set your password."
+                            )
+                    elif verify_password(entered_cust_pass, matched["password_hash"]):
                         st.session_state["role"] = "customer"
                         st.session_state["customer_user"] = {
-                            "id": matched_customer[0],
-                            "name": matched_customer[1],
+                            "id": matched["customer_id"],
+                            "name": matched.get("name", f"Customer #{matched['customer_id']}"),
                         }
                         st.rerun()
                     else:
-                        st.error("Customer not found. Check your spelling or register below.")
+                        st.error("Incorrect password.")
 
         st.write("")
-        render_add_row_form(
-            "customers",
-            "customer_id",
-            "self_register_customer",
-            "New Customer? Register Here",
-        )
+        with st.expander("+ New Customer? Register Personal Account"):
+            cust_cols = get_editable_columns("customers", "customer_id")
+            with st.form("self_register_customer", clear_on_submit=True):
+                reg_values = {
+                    col_name: render_field_input(col_name, data_type, widget_key=f"reg_{col_name}")
+                    for col_name, data_type in cust_cols
+                }
+                reg_pass = st.text_input("Create Personal Password", type="password")
+                reg_pass_confirm = st.text_input("Confirm Personal Password", type="password")
+                if st.form_submit_button("Create My Account"):
+                    if len(reg_pass) < 4:
+                        st.warning("Password must be at least 4 characters long.")
+                    elif reg_pass != reg_pass_confirm:
+                        st.error("Passwords do not match.")
+                    else:
+                        try:
+                            reg_values["password_hash"] = hash_password(reg_pass)
+                            cols = list(reg_values.keys())
+                            query = sql.SQL("INSERT INTO {} ({}) VALUES ({});").format(
+                                sql.Identifier("customers"),
+                                sql.SQL(", ").join(map(sql.Identifier, cols)),
+                                sql.SQL(", ").join(sql.Placeholder() * len(cols)),
+                            )
+                            with psycopg.connect(DB_URL) as conn:
+                                with conn.cursor() as cur:
+                                    cur.execute(query, [reg_values[c] for c in cols])
+                            st.success("Account created! You can now log in above.")
+                        except Exception as e:
+                            st.error(f"Could not create account: {e}")
 
     return False
 
@@ -245,6 +497,10 @@ all_reservations, _ = fetch_table(
 
 book_names = {r[0]: r[1] for r in book_rows}
 customer_names = {r[0]: r[1] for r in customer_rows}
+customer_contacts = {
+    c["customer_id"]: {"email": c.get("email"), "phone": c.get("phone")}
+    for c in customers_data
+}
 today = date.today()
 
 pending_reservations = [res for res in all_reservations if res[4] == "Pending"]
@@ -351,7 +607,7 @@ if st.session_state["role"] == "customer":
             st.info("No additional books are currently available to reserve.")
 
         catalog_search = (
-            st.text_input("Search Book Catalog", placeholder="Search by title or details...")
+            st.text_input("Search Book Catalog", placeholder="Search by title, author, ISBN...")
             .strip()
             .lower()
         )
@@ -428,7 +684,10 @@ def render_edit_row_form(table_name, id_col, raw_rows, dict_rows, form_key, expa
         with st.form(f"{form_key}_{record_id}"):
             updated_values = {
                 col_name: render_field_input(
-                    col_name, data_type, current_val=selected_dict.get(col_name)
+                    col_name,
+                    data_type,
+                    current_val=selected_dict.get(col_name),
+                    widget_key=f"{form_key}{record_id}{col_name}",
                 )
                 for col_name, data_type in col_rows
             }
@@ -463,7 +722,7 @@ total_active_late_fees = sum(
 )
 available_books = [(raw, d) for raw, d in zip(book_rows, books_data) if d.get("stock", 0) > 0]
 
-# --- OVERDUE ALERTS BANNER ---
+# --- OVERDUE ALERTS & AUTOMATED EMAIL/SMS REMINDERS ---
 if overdue_rentals:
     alert_items = [
         f"Rental #{r[0]}: *{book_names.get(r[1], f'Book #{r[1]}')}* borrowed by "
@@ -476,6 +735,46 @@ if overdue_rentals:
         + "\n".join(f"- {item}" for item in alert_items)
     )
 
+    with st.expander("Send AutomatedOverdue Email / SMS Reminder"):
+        selected_overdue = st.selectbox(
+            "Select Overdue Rental to Notify",
+            overdue_rentals,
+            format_func=lambda r: (
+                f"Rental #{r[0]}: {customer_names.get(r[2], f'Customer #{r[2]}')} — "
+                f"{book_names.get(r[1], f'Book #{r[1]}')} ({(today - r[5]).days} days late)"
+            ),
+        )
+        ov_cust_id = selected_overdue[2]
+        ov_cust_name = customer_names.get(ov_cust_id, f"Customer #{ov_cust_id}")
+        ov_book_title = book_names.get(selected_overdue[1], f"Book #{selected_overdue[1]}")
+        ov_days = (today - selected_overdue[5]).days
+        ov_fee = calculate_late_fee(None, selected_overdue[5], daily_late_fee)
+        contact = customer_contacts.get(ov_cust_id, {})
+
+        default_msg = (
+            f"Hello {ov_cust_name}, reminder from Bookstore Cloud Portal: "
+            f"'{ov_book_title}' was due on {selected_overdue[5]} ({ov_days} days overdue). "
+            f"Current late fee is {currency} {ov_fee:,.2f}. Please return it soon."
+        )
+        reminder_msg = st.text_area("Reminder Message", value=default_msg, height=90)
+        st.caption(
+            f"Customer Contact on File — Email: {contact.get('email') or 'Not set'} | "
+            f"Phone: {contact.get('phone') or 'Not set'}"
+        )
+        col_send_email, col_send_sms = st.columns(2)
+        with col_send_email:
+            if st.button("Send Email Reminder"):
+                ok, info = send_email_reminder(
+                    contact.get("email"),
+                    f"Overdue Book Reminder: {ov_book_title}",
+                    reminder_msg,
+                )
+                (st.success if ok else st.warning)(info)
+        with col_send_sms:
+            if st.button("Send SMS Reminder"):
+                ok, info = send_sms_reminder(contact.get("phone"), reminder_msg)
+                (st.success if ok else st.warning)(info)
+
 # --- KPI SUMMARY METRICS ---
 m1, m2, m3, m4, m5, m6, m7 = st.columns(7)
 m1.metric("Book Titles", len(book_rows))
@@ -485,6 +784,27 @@ m4.metric("Active Rentals", len(active_rentals))
 m5.metric("Overdue", len(overdue_rentals))
 m6.metric("Pending Pickups", len(pending_reservations))
 m7.metric("Active Late Fees", f"{currency} {total_active_late_fees:,.2f}")
+
+# --- PRINTABLE PDF RECEIPT BANNER (AFTER CHECKOUT OR RETURN) ---
+if st.session_state.get("last_receipt"):
+    rec = st.session_state["last_receipt"]
+    st.success(
+        f"*{rec['type']} Recorded* for *{rec['customer_name']}* — "
+        f"{rec['book_title']} (Rental #{rec['rental_id']})."
+    )
+    col_pdf_dl, col_pdf_dismiss = st.columns([3, 1])
+    with col_pdf_dl:
+        st.download_button(
+            f"Download {rec['type']} Receipt (PDF)",
+            data=build_receipt_pdf(rec),
+            file_name=f"receipt_rental_{rec['rental_id']}_{rec['type'].lower()}.pdf",
+            mime="application/pdf",
+            type="primary",
+        )
+    with col_pdf_dismiss:
+        if st.button("Dismiss Receipt"):
+            st.session_state["last_receipt"] = None
+            st.rerun()
 
 # --- CUSTOMER PICKUP RESERVATIONS QUEUE ---
 if pending_reservations:
@@ -520,13 +840,30 @@ if pending_reservations:
                             st.error("Cannot fulfill reservation: book is out of stock.")
                         else:
                             cur.execute(
-                                "INSERT INTO rentals (book_id, customer_id, borrow_date, due_date) VALUES (%s, %s, %s, %s);",
+                                "INSERT INTO rentals (book_id, customer_id, borrow_date, due_date) VALUES (%s, %s, %s, %s) RETURNING rental_id;",
                                 (selected_res[1], selected_res[2], today, res_due_date),
                             )
+                            new_rid = cur.fetchone()[0]
                             cur.execute(
                                 "UPDATE reservations SET status = 'Fulfilled' WHERE reservation_id = %s;",
                                 (selected_res[0],),
                             )
+                            st.session_state["last_receipt"] = {
+                                "receipt_no": f"CHK-{new_rid}",
+                                "type": "Checkout",
+                                "issued_date": str(today),
+                                "rental_id": new_rid,
+                                "customer_id": selected_res[2],
+                                "customer_name": customer_names.get(selected_res[2], f"Customer #{selected_res[2]}"),
+                                "book_id": selected_res[1],
+                                "book_title": book_names.get(selected_res[1], f"Book #{selected_res[1]}"),
+                                "borrow_date": str(today),
+                                "due_date": str(res_due_date),
+                                "return_date": "Not yet returned",
+                                "status": "Active Checkout",
+                                "currency": currency,
+                                "late_fee": 0.0,
+                            }
                             st.rerun()
             elif decline_btn:
                 with psycopg.connect(DB_URL) as conn:
@@ -573,9 +910,26 @@ with col_checkout:
                             st.error("This book just went out of stock.")
                         else:
                             cur.execute(
-                                "INSERT INTO rentals (book_id, customer_id, borrow_date, due_date) VALUES (%s, %s, %s, %s);",
+                                "INSERT INTO rentals (book_id, customer_id, borrow_date, due_date) VALUES (%s, %s, %s, %s) RETURNING rental_id;",
                                 (book_id, selected_customer[0], today, due_date),
                             )
+                            new_rid = cur.fetchone()[0]
+                            st.session_state["last_receipt"] = {
+                                "receipt_no": f"CHK-{new_rid}",
+                                "type": "Checkout",
+                                "issued_date": str(today),
+                                "rental_id": new_rid,
+                                "customer_id": selected_customer[0],
+                                "customer_name": selected_customer[1],
+                                "book_id": book_id,
+                                "book_title": selected_book[0][1],
+                                "borrow_date": str(today),
+                                "due_date": str(due_date),
+                                "return_date": "Not yet returned",
+                                "status": "Active Checkout",
+                                "currency": currency,
+                                "late_fee": 0.0,
+                            }
                             st.rerun()
     elif not book_rows or not customer_rows:
         st.info("Add a book and customer below to start checking out books.")
@@ -596,6 +950,7 @@ with col_return:
                 ),
             )
             if st.form_submit_button("Mark Book Returned"):
+                settled_fee = calculate_late_fee(today, selected_rental[5], daily_late_fee)
                 with psycopg.connect(DB_URL) as conn:
                     with conn.cursor() as cur:
                         cur.execute(
@@ -608,6 +963,22 @@ with col_return:
                                 "UPDATE books SET stock = stock + 1 WHERE book_id = %s;",
                                 (returned_row[0],),
                             )
+                            st.session_state["last_receipt"] = {
+                                "receipt_no": f"RET-{selected_rental[0]}",
+                                "type": "Return",
+                                "issued_date": str(today),
+                                "rental_id": selected_rental[0],
+                                "customer_id": selected_rental[2],
+                                "customer_name": customer_names.get(selected_rental[2], f"Customer #{selected_rental[2]}"),
+                                "book_id": selected_rental[1],
+                                "book_title": book_names.get(selected_rental[1], f"Book #{selected_rental[1]}"),
+                                "borrow_date": str(selected_rental[3]),
+                                "due_date": str(selected_rental[5]) if selected_rental[5] else "N/A",
+                                "return_date": str(today),
+                                "status": "Returned",
+                                "currency": currency,
+                                "late_fee": settled_fee,
+                            }
                 st.rerun()
     else:
         st.info("No active unreturned rentals right now.")
@@ -692,6 +1063,38 @@ with tab_rentals:
         )
 
     if all_rentals:
+        with st.expander("Reprint PDF Receipt for Any Rental"):
+            reprint_rental = st.selectbox(
+                "Select Rental for PDF Receipt",
+                all_rentals,
+                format_func=lambda r: (
+                    f"Rental #{r[0]}: {book_names.get(r[1], f'Book #{r[1]}')} — "
+                    f"{customer_names.get(r[2], f'Customer #{r[2]}')} ({format_rental_status(r[4], r[5])})"
+                ),
+            )
+            reprint_payload = {
+                "receipt_no": f"RPT-{reprint_rental[0]}",
+                "type": "Return" if reprint_rental[4] else "Checkout",
+                "issued_date": str(today),
+                "rental_id": reprint_rental[0],
+                "customer_id": reprint_rental[2],
+                "customer_name": customer_names.get(reprint_rental[2], f"Customer #{reprint_rental[2]}"),
+                "book_id": reprint_rental[1],
+                "book_title": book_names.get(reprint_rental[1], f"Book #{reprint_rental[1]}"),
+                "borrow_date": str(reprint_rental[3]),
+                "due_date": str(reprint_rental[5]) if reprint_rental[5] else "N/A",
+                "return_date": str(reprint_rental[4]) if reprint_rental[4] else "Not yet returned",
+                "status": format_rental_status(reprint_rental[4], reprint_rental[5]),
+                "currency": currency,
+                "late_fee": calculate_late_fee(reprint_rental[4], reprint_rental[5], daily_late_fee),
+            }
+            st.download_button(
+                "Download Selected Rental Receipt (PDF)",
+                data=build_receipt_pdf(reprint_payload),
+                file_name=f"receipt_rental_{reprint_rental[0]}.pdf",
+                mime="application/pdf",
+            )
+
         with st.expander("Delete a Rental Record"):
             with st.form("delete_rental_form"):
                 rental_to_delete = st.selectbox(
@@ -775,9 +1178,40 @@ with tab_analytics:
         st.line_chart(trend_chart, x="Borrow Date", y="Checkouts")
 
 with tab_books:
+    if "isbn_prefill" not in st.session_state:
+        st.session_state["isbn_prefill"] = {}
+
     col_b_add, col_b_edit = st.columns(2)
     with col_b_add:
-        render_add_row_form("books", "book_id", "add_book_form", "Add New Book")
+        with st.expander("+ Add New Book (with ISBN Barcode Auto-Fill)", expanded=bool(st.session_state["isbn_prefill"])):
+            with st.form("isbn_lookup_form"):
+                scanned_isbn = st.text_input(
+                    "Scan Barcode or Enter ISBN-10 / ISBN-13",
+                    placeholder="e.g. 9780735211292",
+                )
+                if st.form_submit_button("Auto-Fill from Open Library"):
+                    fetched_meta, err_msg = lookup_isbn_metadata(scanned_isbn)
+                    if err_msg:
+                        st.warning(err_msg)
+                    else:
+                        st.session_state["isbn_prefill"] = fetched_meta
+                        st.rerun()
+
+            if st.session_state["isbn_prefill"]:
+                pf = st.session_state["isbn_prefill"]
+                st.info(
+                    f"Loaded ISBN {pf.get('isbn')}: *{pf.get('title')}* "
+                    f"({pf.get('author') or 'Unknown author'})"
+                )
+
+            render_add_row_form(
+                "books",
+                "book_id",
+                "add_book_form",
+                "Save New Book",
+                prefill=st.session_state["isbn_prefill"],
+            )
+
     with col_b_edit:
         render_edit_row_form(
             "books",
@@ -796,7 +1230,7 @@ with tab_books:
         mime="text/csv",
         disabled=not books_data,
     )
-    
+
     if book_rows:
         with st.expander("Delete a Book"):
             with st.form("delete_book_form"):
@@ -826,7 +1260,8 @@ with tab_books:
 with tab_customers:
     col_c_add, col_c_edit = st.columns(2)
     with col_c_add:
-        render_add_row_form("customers", "customer_id", "add_customer_form", "Add New Customer")
+        with st.expander("+ Add New Customer"):
+            render_add_row_form("customers", "customer_id", "add_customer_form", "Add New Customer")
     with col_c_edit:
         render_edit_row_form(
             "customers",
@@ -837,40 +1272,67 @@ with tab_customers:
             "Edit Customer Details",
         )
 
-    st.dataframe(customers_data, hide_index=True, use_container_width=True)
+    safe_customers_display = [
+        {k: v for k, v in row.items() if k != "password_hash"}
+        for row in customers_data
+    ]
+    st.dataframe(safe_customers_display, hide_index=True, use_container_width=True)
     st.download_button(
         "Download Customers CSV",
-        data=to_csv_bytes(customers_data),
+        data=to_csv_bytes(safe_customers_display),
         file_name=f"customers_list_{today}.csv",
         mime="text/csv",
-        disabled=not customers_data,
+        disabled=not safe_customers_display,
     )
 
     if customer_rows:
-        with st.expander("Delete a Customer"):
-            with st.form("delete_customer_form"):
-                customer_to_delete = st.selectbox(
-                    "Select Customer to Delete",
-                    customer_rows,
-                    format_func=lambda r: f"{r[0]} - {r[1]}",
-                )
-                confirm_cust_del = st.checkbox("Confirm permanent deletion of this customer")
-                if st.form_submit_button("Delete Customer", type="primary"):
-                    if not confirm_cust_del:
-                        st.warning("Please tick the confirmation box first.")
-                    else:
-                        try:
+        col_c_reset, col_c_del = st.columns(2)
+        with col_c_reset:
+            with st.expander("Reset Customer Portal Password"):
+                with st.form("reset_cust_pass_form", clear_on_submit=True):
+                    cust_to_reset = st.selectbox(
+                        "Select Customer",
+                        customer_rows,
+                        format_func=lambda r: f"{r[0]} - {r[1]}",
+                    )
+                    new_cust_pw = st.text_input("New Personal Password", type="password")
+                    if st.form_submit_button("Update Customer Password"):
+                        if len(new_cust_pw) < 4:
+                            st.warning("Password must be at least 4 characters.")
+                        else:
                             with psycopg.connect(DB_URL) as conn:
                                 with conn.cursor() as cur:
                                     cur.execute(
-                                        "DELETE FROM customers WHERE customer_id = %s;",
-                                        (customer_to_delete[0],),
+                                        "UPDATE customers SET password_hash = %s WHERE customer_id = %s;",
+                                        (hash_password(new_cust_pw), cust_to_reset[0]),
                                     )
-                            st.rerun()
-                        except psycopg.errors.ForeignKeyViolation:
-                            st.error("Cannot delete this customer because they still have rental records. Delete their rentals first.")
-                        except Exception as e:
-                            st.error(f"Could not delete customer: {e}")
+                            st.success(f"Password updated for {cust_to_reset[1]}.")
+
+        with col_c_del:
+            with st.expander("Delete a Customer"):
+                with st.form("delete_customer_form"):
+                    customer_to_delete = st.selectbox(
+                        "Select Customer to Delete",
+                        customer_rows,
+                        format_func=lambda r: f"{r[0]} - {r[1]}",
+                    )
+                    confirm_cust_del = st.checkbox("Confirm permanent deletion of this customer")
+                    if st.form_submit_button("Delete Customer", type="primary"):
+                        if not confirm_cust_del:
+                            st.warning("Please tick the confirmation box first.")
+                        else:
+                            try:
+                                with psycopg.connect(DB_URL) as conn:
+                                    with conn.cursor() as cur:
+                                        cur.execute(
+                                            "DELETE FROM customers WHERE customer_id = %s;",
+                                            (customer_to_delete[0],),
+                                        )
+                                st.rerun()
+                            except psycopg.errors.ForeignKeyViolation:
+                                st.error("Cannot delete this customer because they still have rental records. Delete their rentals first.")
+                            except Exception as e:
+                                st.error(f"Could not delete customer: {e}")
 
 with tab_logs:
     _, logs_data = fetch_table("SELECT * FROM rental_logs ORDER BY log_id DESC;")
@@ -881,5 +1343,4 @@ with tab_logs:
         file_name=f"rental_audit_logs_{today}.csv",
         mime="text/csv",
         disabled=not logs_data,
-
     )
