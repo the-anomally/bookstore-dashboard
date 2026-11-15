@@ -1,10 +1,12 @@
+import csv
 from datetime import date, timedelta
 import hmac
+import io
 import psycopg
 from psycopg import sql
 import streamlit as st
 
-st.set_page_config(page_title="Bookstore Cloud Dashboard", layout="wide")
+st.set_page_config(page_title="Bookstore Cloud Portal", layout="wide")
 
 DB_URL = st.secrets["DB_URL"]
 
@@ -18,12 +20,49 @@ def fetch_table(query, params=None):
     return rows, [dict(zip(columns, row)) for row in rows]
 
 
-# Ensure return_date, due_date, and book stock columns exist
+def to_csv_bytes(dict_rows):
+    if not dict_rows:
+        return b""
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=list(dict_rows[0].keys()))
+    writer.writeheader()
+    writer.writerows(dict_rows)
+    return output.getvalue().encode("utf-8")
+
+
+# Ensure schema extensions, reservations table, and late-fee settings exist
 with psycopg.connect(DB_URL) as conn:
     with conn.cursor() as cur:
         cur.execute("ALTER TABLE rentals ADD COLUMN IF NOT EXISTS return_date DATE;")
         cur.execute("ALTER TABLE rentals ADD COLUMN IF NOT EXISTS due_date DATE;")
         cur.execute("ALTER TABLE books ADD COLUMN IF NOT EXISTS stock INTEGER NOT NULL DEFAULT 1;")
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS reservations (
+                reservation_id SERIAL PRIMARY KEY,
+                book_id INTEGER NOT NULL REFERENCES books(book_id),
+                customer_id INTEGER NOT NULL REFERENCES customers(customer_id),
+                reserved_date DATE NOT NULL DEFAULT CURRENT_DATE,
+                status TEXT NOT NULL DEFAULT 'Pending'
+            );
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS bookstore_settings (
+                id INTEGER PRIMARY KEY DEFAULT 1,
+                daily_late_fee NUMERIC(10, 2) NOT NULL DEFAULT 50.00,
+                currency TEXT NOT NULL DEFAULT 'KES'
+            );
+            """
+        )
+        cur.execute(
+            """
+            INSERT INTO bookstore_settings (id, daily_late_fee, currency)
+            VALUES (1, 50.00, 'KES')
+            ON CONFLICT (id) DO NOTHING;
+            """
+        )
 
 
 def get_editable_columns(table_name, id_col):
@@ -157,6 +196,16 @@ if not require_login():
     st.stop()
 
 
+def calculate_late_fee(return_date, due_date, daily_rate):
+    if due_date is None:
+        return 0.0
+    effective_end = return_date if return_date is not None else date.today()
+    if effective_end > due_date:
+        days_late = (effective_end - due_date).days
+        return round(days_late * float(daily_rate), 2)
+    return 0.0
+
+
 def format_rental_status(return_date, due_date):
     today = date.today()
     if return_date is not None:
@@ -172,7 +221,11 @@ def format_rental_status(return_date, due_date):
     return f"Active ({days_left} day{'s' if days_left != 1 else ''} left)"
 
 
-# Load shared data
+# Load shared data and store settings
+settings_rows, _ = fetch_table("SELECT daily_late_fee, currency FROM bookstore_settings WHERE id = 1;")
+daily_late_fee = float(settings_rows[0][0]) if settings_rows else 50.00
+currency = settings_rows[0][1] if settings_rows else "KES"
+
 book_rows, books_data = fetch_table("SELECT * FROM books ORDER BY book_id;")
 customer_rows, customers_data = fetch_table("SELECT * FROM customers ORDER BY customer_id;")
 all_rentals, _ = fetch_table(
@@ -182,10 +235,22 @@ all_rentals, _ = fetch_table(
     ORDER BY rental_id DESC;
     """
 )
+all_reservations, _ = fetch_table(
+    """
+    SELECT reservation_id, book_id, customer_id, reserved_date, status
+    FROM reservations
+    ORDER BY reservation_id DESC;
+    """
+)
 
 book_names = {r[0]: r[1] for r in book_rows}
 customer_names = {r[0]: r[1] for r in customer_rows}
 today = date.today()
+
+pending_reservations = [res for res in all_reservations if res[4] == "Pending"]
+pending_res_by_book = {}
+for res in pending_reservations:
+    pending_res_by_book[res[1]] = pending_res_by_book.get(res[1], 0) + 1
 
 # ==============================================================================
 # VIEW A: CUSTOMER PORTAL
@@ -205,22 +270,29 @@ if st.session_state["role"] == "customer":
     my_rentals = [r for r in all_rentals if r[2] == cust["id"]]
     my_active = [r for r in my_rentals if r[4] is None]
     my_overdue = [r for r in my_active if r[5] is not None and r[5] < today]
+    my_total_fees = sum(calculate_late_fee(r[4], r[5], daily_late_fee) for r in my_active)
+    my_reservations = [res for res in all_reservations if res[2] == cust["id"]]
+    my_pending_book_ids = {res[1] for res in my_reservations if res[4] == "Pending"}
 
     if my_overdue:
         overdue_titles = ", ".join(
             f"{book_names.get(r[1], f'Book #{r[1]}')} (due {r[5]})"
             for r in my_overdue
         )
-        st.error(f"Overdue Notice: Please return {overdue_titles}.")
+        st.error(
+            f"Overdue Notice: Please return {overdue_titles}. "
+            f"Current accrued late fees: {currency} {my_total_fees:,.2f} ({currency} {daily_late_fee:,.2f}/day)."
+        )
 
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     c1.metric("My Active Rentals", len(my_active))
     c2.metric("My Overdue Books", len(my_overdue))
-    c3.metric("Total Books Borrowed", len(my_rentals))
+    c3.metric("Accrued Late Fees", f"{currency} {my_total_fees:,.2f}")
+    c4.metric("Pending Reservations", len(my_pending_book_ids))
 
     st.divider()
-    tab_my_rentals, tab_catalog = st.tabs(
-        ["My Borrowed Books & Due Dates", "Browse Available Books"]
+    tab_my_rentals, tab_catalog, tab_my_res = st.tabs(
+        ["My Borrowed Books & Due Dates", "Browse & Reserve Books", "My Reservations"]
     )
 
     with tab_my_rentals:
@@ -232,6 +304,7 @@ if st.session_state["role"] == "customer":
                     "Borrow Date": r[3],
                     "Due Date": r[5] if r[5] else "Not set",
                     "Status": format_rental_status(r[4], r[5]),
+                    f"Late Fee ({currency})": f"{calculate_late_fee(r[4], r[5], daily_late_fee):,.2f}",
                 }
                 for r in my_rentals
             ]
@@ -240,23 +313,86 @@ if st.session_state["role"] == "customer":
             st.info("You have no rental history yet.")
 
     with tab_catalog:
+        reservable_books = []
+        catalog_rows = []
+        for raw, row_dict in zip(book_rows, books_data):
+            book_id = row_dict["book_id"]
+            physical_stock = row_dict.get("stock", 0)
+            reserved_holds = pending_res_by_book.get(book_id, 0)
+            net_available = max(0, physical_stock - reserved_holds)
+
+            clean_row = dict(row_dict)
+            clean_row["Reserved Holds"] = reserved_holds
+            clean_row["Availability"] = (
+                f"Available ({net_available} ready to reserve)"
+                if net_available > 0
+                else "Unavailable / All Copies Held"
+            )
+            catalog_rows.append(clean_row)
+            if net_available > 0 and book_id not in my_pending_book_ids:
+                reservable_books.append((raw, net_available))
+
+        if reservable_books:
+            with st.form("customer_reserve_form", clear_on_submit=True):
+                chosen_res = st.selectbox(
+                    "Reserve a Copy for Pickup",
+                    reservable_books,
+                    format_func=lambda item: f"{item[0][0]} - {item[0][1]} ({item[1]} available)",
+                )
+                if st.form_submit_button("Reserve Copy"):
+                    with psycopg.connect(DB_URL) as conn:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                "INSERT INTO reservations (book_id, customer_id, reserved_date, status) VALUES (%s, %s, %s, 'Pending');",
+                                (chosen_res[0][0], cust["id"], today),
+                            )
+                    st.rerun()
+        else:
+            st.info("No additional books are currently available to reserve.")
+
         catalog_search = (
             st.text_input("Search Book Catalog", placeholder="Search by title or details...")
             .strip()
             .lower()
         )
-        catalog_rows = []
-        for row_dict in books_data:
-            clean_row = dict(row_dict)
-            copies = clean_row.get("stock", 0)
-            clean_row["Availability"] = (
-                f"Available ({copies} in stock)" if copies > 0 else "Out of Stock"
-            )
-            if not catalog_search or any(
-                catalog_search in str(v).lower() for v in clean_row.values()
-            ):
-                catalog_rows.append(clean_row)
-        st.dataframe(catalog_rows, hide_index=True, use_container_width=True)
+        filtered_catalog = [
+            row
+            for row in catalog_rows
+            if not catalog_search or any(catalog_search in str(v).lower() for v in row.values())
+        ]
+        st.dataframe(filtered_catalog, hide_index=True, use_container_width=True)
+
+    with tab_my_res:
+        if my_reservations:
+            res_table = [
+                {
+                    "Reservation ID": res[0],
+                    "Book Title": book_names.get(res[1], f"Book #{res[1]}"),
+                    "Reserved Date": res[3],
+                    "Status": res[4],
+                }
+                for res in my_reservations
+            ]
+            st.dataframe(res_table, hide_index=True, use_container_width=True)
+
+            my_pending_list = [res for res in my_reservations if res[4] == "Pending"]
+            if my_pending_list:
+                with st.form("cancel_my_res_form"):
+                    res_to_cancel = st.selectbox(
+                        "Cancel a Pending Reservation",
+                        my_pending_list,
+                        format_func=lambda res: f"Reservation #{res[0]}: {book_names.get(res[1], f'Book #{res[1]}')} (Reserved {res[3]})",
+                    )
+                    if st.form_submit_button("Cancel Reservation"):
+                        with psycopg.connect(DB_URL) as conn:
+                            with conn.cursor() as cur:
+                                cur.execute(
+                                    "UPDATE reservations SET status = 'Cancelled' WHERE reservation_id = %s;",
+                                    (res_to_cancel[0],),
+                                )
+                        st.rerun()
+        else:
+            st.info("You have not reserved any books yet.")
 
     st.stop()
 
@@ -322,13 +458,17 @@ active_rentals = [r for r in all_rentals if r[4] is None]
 overdue_rentals = [r for r in active_rentals if r[5] is not None and r[5] < today]
 returned_count = len(all_rentals) - len(active_rentals)
 total_copies_in_stock = sum(d.get("stock", 0) for d in books_data)
+total_active_late_fees = sum(
+    calculate_late_fee(r[4], r[5], daily_late_fee) for r in overdue_rentals
+)
 available_books = [(raw, d) for raw, d in zip(book_rows, books_data) if d.get("stock", 0) > 0]
 
 # --- OVERDUE ALERTS BANNER ---
 if overdue_rentals:
     alert_items = [
         f"Rental #{r[0]}: *{book_names.get(r[1], f'Book #{r[1]}')}* borrowed by "
-        f"*{customer_names.get(r[2], f'Customer #{r[2]}')}* (Due {r[5]} — {(today - r[5]).days} days overdue)"
+        f"*{customer_names.get(r[2], f'Customer #{r[2]}')}* (Due {r[5]} — {(today - r[5]).days} days overdue | "
+        f"Late Fee: *{currency} {calculate_late_fee(r[4], r[5], daily_late_fee):,.2f}*)"
         for r in overdue_rentals
     ]
     st.error(
@@ -337,13 +477,65 @@ if overdue_rentals:
     )
 
 # --- KPI SUMMARY METRICS ---
-m1, m2, m3, m4, m5, m6 = st.columns(6)
+m1, m2, m3, m4, m5, m6, m7 = st.columns(7)
 m1.metric("Book Titles", len(book_rows))
 m2.metric("Copies in Stock", total_copies_in_stock)
-m3.metric("Total Customers", len(customer_rows))
+m3.metric("Customers", len(customer_rows))
 m4.metric("Active Rentals", len(active_rentals))
-m5.metric("Overdue Rentals", len(overdue_rentals))
-m6.metric("Returned Rentals", returned_count)
+m5.metric("Overdue", len(overdue_rentals))
+m6.metric("Pending Pickups", len(pending_reservations))
+m7.metric("Active Late Fees", f"{currency} {total_active_late_fees:,.2f}")
+
+# --- CUSTOMER PICKUP RESERVATIONS QUEUE ---
+if pending_reservations:
+    with st.expander(f"Pending Customer Reservations ({len(pending_reservations)} waiting)", expanded=True):
+        with st.form("process_reservation_form"):
+            selected_res = st.selectbox(
+                "Select Reservation",
+                pending_reservations,
+                format_func=lambda res: (
+                    f"Reservation #{res[0]}: {book_names.get(res[1], f'Book #{res[1]}')} — "
+                    f"for {customer_names.get(res[2], f'Customer #{res[2]}')} (Requested {res[3]})"
+                ),
+            )
+            res_due_date = st.date_input(
+                "Due Date if Approving Checkout",
+                value=today + timedelta(days=14),
+                min_value=today,
+            )
+            col_approve, col_decline = st.columns(2)
+            with col_approve:
+                approve_btn = st.form_submit_button("Approve & Check Out", type="primary")
+            with col_decline:
+                decline_btn = st.form_submit_button("Cancel Reservation")
+
+            if approve_btn:
+                with psycopg.connect(DB_URL) as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "UPDATE books SET stock = stock - 1 WHERE book_id = %s AND stock > 0 RETURNING stock;",
+                            (selected_res[1],),
+                        )
+                        if cur.fetchone() is None:
+                            st.error("Cannot fulfill reservation: book is out of stock.")
+                        else:
+                            cur.execute(
+                                "INSERT INTO rentals (book_id, customer_id, borrow_date, due_date) VALUES (%s, %s, %s, %s);",
+                                (selected_res[1], selected_res[2], today, res_due_date),
+                            )
+                            cur.execute(
+                                "UPDATE reservations SET status = 'Fulfilled' WHERE reservation_id = %s;",
+                                (selected_res[0],),
+                            )
+                            st.rerun()
+            elif decline_btn:
+                with psycopg.connect(DB_URL) as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "UPDATE reservations SET status = 'Cancelled' WHERE reservation_id = %s;",
+                            (selected_res[0],),
+                        )
+                st.rerun()
 
 st.divider()
 
@@ -399,7 +591,8 @@ with col_return:
                 active_rentals,
                 format_func=lambda r: (
                     f"Rental #{r[0]}: {book_names.get(r[1], f'Book #{r[1]}')} — "
-                    f"{customer_names.get(r[2], f'Customer #{r[2]}')} | Due: {r[5] if r[5] else 'N/A'}"
+                    f"{customer_names.get(r[2], f'Customer #{r[2]}')} | "
+                    f"Fee: {currency} {calculate_late_fee(None, r[5], daily_late_fee):,.2f}"
                 ),
             )
             if st.form_submit_button("Mark Book Returned"):
@@ -419,10 +612,29 @@ with col_return:
     else:
         st.info("No active unreturned rentals right now.")
 
-# --- SECTION 2: Database Explorer, Search, Edit & Delete Controls ---
-st.subheader("Database Explorer")
-tab_rentals, tab_books, tab_customers, tab_logs = st.tabs(
-    ["Live Rentals (View)", "Books", "Customers", "Audit Logs (Trigger)"]
+# --- LATE FEE RATE CONFIGURATION ---
+with st.expander(f"Late Fee Settings (Current: {currency} {daily_late_fee:,.2f} / day)"):
+    with st.form("late_fee_settings_form"):
+        col_curr, col_rate = st.columns(2)
+        with col_curr:
+            new_currency = st.text_input("Currency Code / Symbol", value=currency).strip() or "KES"
+        with col_rate:
+            new_rate = st.number_input(
+                "Daily Overdue Rate", min_value=0.0, step=5.0, value=daily_late_fee
+            )
+        if st.form_submit_button("Update Late Fee Settings"):
+            with psycopg.connect(DB_URL) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE bookstore_settings SET currency = %s, daily_late_fee = %s WHERE id = 1;",
+                        (new_currency, new_rate),
+                    )
+            st.rerun()
+
+# --- SECTION 2: Database Explorer, Analytics & CSV Exports ---
+st.subheader("Database Explorer & Reports")
+tab_rentals, tab_analytics, tab_books, tab_customers, tab_logs = st.tabs(
+    ["Live Rentals (View)", "Analytics", "Books", "Customers", "Audit Logs (Trigger)"]
 )
 
 with tab_rentals:
@@ -432,8 +644,11 @@ with tab_rentals:
     for row in rentals_data:
         item = dict(row)
         meta = rental_meta.get(item.get("rental_id"), {})
-        item["due_date"] = meta.get("due_date")
-        item["status"] = format_rental_status(meta.get("return_date"), meta.get("due_date"))
+        due_d = meta.get("due_date")
+        ret_d = meta.get("return_date")
+        item["due_date"] = due_d
+        item["status"] = format_rental_status(ret_d, due_d)
+        item[f"late_fee_{currency}"] = calculate_late_fee(ret_d, due_d, daily_late_fee)
         enriched_rentals.append(item)
 
     search_term = (
@@ -454,6 +669,27 @@ with tab_rentals:
         filtered_rentals = enriched_rentals
 
     st.dataframe(filtered_rentals, hide_index=True, use_container_width=True)
+
+    col_dl1, col_dl2 = st.columns(2)
+    with col_dl1:
+        st.download_button(
+            "Download Rentals CSV",
+            data=to_csv_bytes(filtered_rentals),
+            file_name=f"rentals_report_{today}.csv",
+            mime="text/csv",
+            disabled=not filtered_rentals,
+        )
+    with col_dl2:
+        overdue_export = [
+            row for row in enriched_rentals if str(row.get("status", "")).startswith("OVERDUE")
+        ]
+        st.download_button(
+            "Download Overdue Report CSV",
+            data=to_csv_bytes(overdue_export),
+            file_name=f"overdue_rentals_{today}.csv",
+            mime="text/csv",
+            disabled=not overdue_export,
+        )
 
     if all_rentals:
         with st.expander("Delete a Rental Record"):
@@ -486,7 +722,8 @@ with tab_rentals:
                                         "DELETE FROM rentals WHERE rental_id = %s;",
                                         (rental_to_delete[0],),
                                     )
-                                    if rental_to_delete[4] is None:cur.execute(
+                                    if rental_to_delete[4] is None:
+                                        cur.execute(
                                             "UPDATE books SET stock = stock + 1 WHERE book_id = %s;",
                                             (rental_to_delete[1],),
                                         )
@@ -495,6 +732,47 @@ with tab_rentals:
                             st.error("This rental is referenced in rental_logs. Tick the second box above to remove its linked log entry as well.")
                         except Exception as e:
                             st.error(f"Could not delete rental: {e}")
+
+with tab_analytics:
+    if not all_rentals:
+        st.info("Record at least one rental to generate bookstore analytics charts.")
+    else:
+        chart_col1, chart_col2 = st.columns(2)
+
+        with chart_col1:
+            st.markdown("*Most Borrowed Books*")
+            book_counts = {}
+            for r in all_rentals:
+                title = book_names.get(r[1], f"Book #{r[1]}")
+                book_counts[title] = book_counts.get(title, 0) + 1
+            top_books_chart = [
+                {"Book Title": title, "Total Rentals": count}
+                for title, count in sorted(book_counts.items(), key=lambda x: x[1], reverse=True)[:10]
+            ]
+            st.bar_chart(top_books_chart, x="Book Title", y="Total Rentals")
+
+        with chart_col2:
+            st.markdown("*Top Customers by Rentals*")
+            cust_counts = {}
+            for r in all_rentals:
+                cname = customer_names.get(r[2], f"Customer #{r[2]}")
+                cust_counts[cname] = cust_counts.get(cname, 0) + 1
+            top_cust_chart = [
+                {"Customer": cname, "Total Rentals": count}
+                for cname, count in sorted(cust_counts.items(), key=lambda x: x[1], reverse=True)[:10]
+            ]
+            st.bar_chart(top_cust_chart, x="Customer", y="Total Rentals")
+
+        st.markdown("*Checkout Activity Over Time*")
+        daily_counts = {}
+        for r in all_rentals:
+            b_date = str(r[3])
+            daily_counts[b_date] = daily_counts.get(b_date, 0) + 1
+        trend_chart = [
+            {"Borrow Date": d_str, "Checkouts": count}
+            for d_str, count in sorted(daily_counts.items())
+        ]
+        st.line_chart(trend_chart, x="Borrow Date", y="Checkouts")
 
 with tab_books:
     col_b_add, col_b_edit = st.columns(2)
@@ -511,7 +789,14 @@ with tab_books:
         )
 
     st.dataframe(books_data, hide_index=True, use_container_width=True)
-
+    st.download_button(
+        "Download Inventory CSV",
+        data=to_csv_bytes(books_data),
+        file_name=f"books_inventory_{today}.csv",
+        mime="text/csv",
+        disabled=not books_data,
+    )
+    
     if book_rows:
         with st.expander("Delete a Book"):
             with st.form("delete_book_form"):
@@ -553,6 +838,13 @@ with tab_customers:
         )
 
     st.dataframe(customers_data, hide_index=True, use_container_width=True)
+    st.download_button(
+        "Download Customers CSV",
+        data=to_csv_bytes(customers_data),
+        file_name=f"customers_list_{today}.csv",
+        mime="text/csv",
+        disabled=not customers_data,
+    )
 
     if customer_rows:
         with st.expander("Delete a Customer"):
@@ -583,3 +875,9 @@ with tab_customers:
 with tab_logs:
     _, logs_data = fetch_table("SELECT * FROM rental_logs ORDER BY log_id DESC;")
     st.dataframe(logs_data, hide_index=True, use_container_width=True)
+    st.download_button(
+        "Download Audit Logs CSV",
+        data=to_csv_bytes(logs_data),
+        file_name=f"rental_audit_logs_{today}.csv",
+        mime="text/csv",
+        disabled=not logs_data,
