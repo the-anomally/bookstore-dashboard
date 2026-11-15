@@ -1,12 +1,47 @@
 from datetime import date
+import hmac
 import psycopg
 from psycopg import sql
 import streamlit as st
 
+st.set_page_config(page_title="Bookstore Cloud Dashboard", layout="wide")
+
+# --- STAFF LOGIN GATE ---
+if "authenticated" not in st.session_state:
+  st.session_state["authenticated"] = False
+
+
+def require_login():
+  if st.session_state["authenticated"]:
+    return True
+
+  st.title("Bookstore Cloud Dashboard")
+  st.subheader("Staff Login")
+  with st.form("login_form"):
+    entered_password = st.text_input("Staff Password", type="password")
+    if st.form_submit_button("Log In"):
+      if hmac.compare_digest(entered_password, st.secrets["STAFF_PASSWORD"]):
+        st.session_state["authenticated"] = True
+        st.rerun()
+      else:
+        st.error("Incorrect password.")
+  return False
+
+
+if not require_login():
+  st.stop()
+
+# --- AUTHENTICATED DASHBOARD ---
 DB_URL = st.secrets["DB_URL"]
 
-st.set_page_config(page_title="Bookstore Cloud Dashboard", layout="wide")
-st.title("Bookstore Cloud Dashboard")
+col_title, col_logout = st.columns([6, 1])
+with col_title:
+  st.title("Bookstore Cloud Dashboard")
+with col_logout:
+  st.write("")
+  if st.button("Log Out"):
+    st.session_state["authenticated"] = False
+    st.rerun()
 
 
 def fetch_table(query, params=None):
