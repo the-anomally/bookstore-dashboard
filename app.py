@@ -1272,7 +1272,7 @@ with tab_rentals:
                 "borrow_date": str(reprint_rental[3]),
                 "due_date": str(reprint_rental[5]) if reprint_rental[5] else "N/A",
                 "return_date": str(reprint_rental[4]) if reprint_rental[4] else "Not yet returned",
-                "status": format_rental_status(reprint_rental[4], reprint_rental[4] else ,"Not yet returned",
+               
                 "status": format_rental_status(reprint_rental[4], reprint_rental[5]),
                 "currency": currency,
                 "late_fee": calculate_late_fee(reprint_rental[4], reprint_rental[5], daily_late_fee),)
