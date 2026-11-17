@@ -83,30 +83,57 @@ def lookup_isbn_metadata(raw_isbn):
         return None, f"ISBN lookup failed: {e}"
 
 
-# --- PRINTABLE PDF RECEIPT GENERATOR (PURE PYTHON PDF 1.4) ---
+# --- PRINTABLE PDF RECEIPT GENERATOR (RENTALS & RETAIL SALES) ---
 def build_receipt_pdf(receipt_data):
     def pdf_escape(val):
         s = str(val).encode("latin-1", "replace").decode("latin-1")
         return s.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
 
-    lines = [
-        ("F2", 16, 50, 775, "BOOKSTORE CLOUD PORTAL"),
-        ("F1", 11, 50, 755, f"OFFICIAL {receipt_data['type'].upper()} RECEIPT"),
-        ("F1", 10, 50, 730, f"Receipt No: #{receipt_data['receipt_no']}    Issued Date: {receipt_data['issued_date']}"),
-        ("F1", 10, 50, 714, "-" * 74),
-        ("F2", 11, 50, 692, "CUSTOMER DETAILS"),
-        ("F1", 10, 50, 676, f"Customer: {receipt_data['customer_name']} (ID #{receipt_data['customer_id']})"),
-        ("F2", 11, 50, 650, "BOOK & RENTAL SUMMARY"),
-        ("F1", 10, 50, 634, f"Rental ID: #{receipt_data['rental_id']}"),
-        ("F1", 10, 50, 618, f"Book Title: {receipt_data['book_title']} (Book ID #{receipt_data['book_id']})"),
-        ("F1", 10, 50, 602, f"Borrow Date: {receipt_data['borrow_date']}"),
-        ("F1", 10, 50, 586, f"Due Date: {receipt_data['due_date']}"),
-        ("F1", 10, 50, 570, f"Return Date: {receipt_data['return_date']}"),
-        ("F1", 10, 50, 554, f"Status: {receipt_data['status']}"),
-        ("F1", 10, 50, 534, "-" * 74),
-        ("F2", 12, 50, 514, f"Late Fee Balance / Paid: {receipt_data['currency']} {receipt_data['late_fee']:,.2f}"),
-        ("F1", 9, 50, 480, "Thank you for reading with us. Please retain this receipt for your records."),
-    ]
+    curr = receipt_data["currency"]
+    cust_id_display = (
+        f"ID #{receipt_data['customer_id']}"
+        if receipt_data.get("customer_id")
+        else "Walk-in"
+    )
+
+    if receipt_data["type"] == "Sale":
+        lines = [
+            ("F2", 16, 50, 775, "BOOKSTORE CLOUD PORTAL"),
+            ("F1", 11, 50, 755, "OFFICIAL RETAIL SALES RECEIPT"),
+            ("F1", 10, 50, 730, f"Receipt No: #{receipt_data['receipt_no']}    Issued Date: {receipt_data['issued_date']}"),
+            ("F1", 10, 50, 714, "-" * 74),
+            ("F2", 11, 50, 692, "CUSTOMER DETAILS"),
+            ("F1", 10, 50, 676, f"Customer: {receipt_data['customer_name']} ({cust_id_display})"),
+            ("F2", 11, 50, 650, "PURCHASE SUMMARY"),
+            ("F1", 10, 50, 634, f"Sale ID: #{receipt_data['record_id']}"),
+            ("F1", 10, 50, 618, f"Book Title: {receipt_data['book_title']} (Book ID #{receipt_data['book_id']})"),
+            ("F1", 10, 50, 602, f"Quantity: {receipt_data['quantity']}    Unit Price: {curr} {receipt_data['unit_price']:,.2f}"),
+            ("F1", 10, 50, 586, f"Payment Method: {receipt_data['payment_method']}"),
+            ("F1", 10, 50, 570, f"Payment Reference: {receipt_data.get('payment_ref') or 'N/A'}"),
+            ("F1", 10, 50, 550, "-" * 74),
+            ("F2", 12, 50, 530, f"Total Amount Paid: {curr} {receipt_data['total_amount']:,.2f}"),
+            ("F1", 9, 50, 495, "Thank you for your purchase! Please retain this receipt for your records."),
+        ]
+    else:
+        lines = [
+            ("F2", 16, 50, 775, "BOOKSTORE CLOUD PORTAL"),
+            ("F1", 11, 50, 755, f"OFFICIAL {receipt_data['type'].upper()} RECEIPT"),
+            ("F1", 10, 50, 730, f"Receipt No: #{receipt_data['receipt_no']}    Issued Date: {receipt_data['issued_date']}"),
+            ("F1", 10, 50, 714, "-" * 74),
+            ("F2", 11, 50, 692, "CUSTOMER DETAILS"),
+            ("F1", 10, 50, 676, f"Customer: {receipt_data['customer_name']} ({cust_id_display})"),
+            ("F2", 11, 50, 650, "BOOK & RENTAL SUMMARY"),
+            ("F1", 10, 50, 634, f"Rental ID: #{receipt_data['record_id']}"),
+            ("F1", 10, 50, 618, f"Book Title: {receipt_data['book_title']} (Book ID #{receipt_data['book_id']})"),
+            ("F1", 10, 50, 602, f"Borrow Date: {receipt_data['borrow_date']}"),
+            ("F1", 10, 50, 586, f"Due Date: {receipt_data['due_date']}"),
+            ("F1", 10, 50, 570, f"Return Date: {receipt_data['return_date']}"),
+            ("F1", 10, 50, 554, f"Status: {receipt_data['status']}"),
+            ("F1", 10, 50, 534, "-" * 74),
+            ("F2", 12, 50, 514, f"Late Fee Balance / Paid: {curr} {receipt_data['late_fee']:,.2f}"),
+            ("F1", 9, 50, 480, "Thank you for reading with us. Please retain this receipt for your records."),
+        ]
+
     stream_cmds = [
         f"BT /{font} {size} Tf {x} {y} Td ({pdf_escape(text)}) Tj ET"
         for font, size, x, y, text in lines
@@ -207,18 +234,34 @@ def send_sms_reminder(phone_number, message_text):
         return False, f"SMS failed: {e}"
 
 
-# Ensure schema extensions, customer auth columns, reservations, and settings exist
+# Ensure schema extensions, retail sales table, reservations, and settings exist
 with psycopg.connect(DB_URL) as conn:
     with conn.cursor() as cur:
         cur.execute("ALTER TABLE rentals ADD COLUMN IF NOT EXISTS return_date DATE;")
         cur.execute("ALTER TABLE rentals ADD COLUMN IF NOT EXISTS due_date DATE;")
         cur.execute("ALTER TABLE books ADD COLUMN IF NOT EXISTS stock INTEGER NOT NULL DEFAULT 1;")
+        cur.execute("ALTER TABLE books ADD COLUMN IF NOT EXISTS selling_price NUMERIC(10, 2) NOT NULL DEFAULT 0.00;")
         cur.execute("ALTER TABLE books ADD COLUMN IF NOT EXISTS isbn TEXT;")
         cur.execute("ALTER TABLE books ADD COLUMN IF NOT EXISTS author TEXT;")
         cur.execute("ALTER TABLE books ADD COLUMN IF NOT EXISTS publisher TEXT;")
         cur.execute("ALTER TABLE customers ADD COLUMN IF NOT EXISTS email TEXT;")
         cur.execute("ALTER TABLE customers ADD COLUMN IF NOT EXISTS phone TEXT;")
         cur.execute("ALTER TABLE customers ADD COLUMN IF NOT EXISTS password_hash TEXT;")
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sales (
+                sale_id SERIAL PRIMARY KEY,
+                book_id INTEGER NOT NULL REFERENCES books(book_id),
+                customer_id INTEGER REFERENCES customers(customer_id),
+                quantity INTEGER NOT NULL DEFAULT 1,
+                unit_price NUMERIC(10, 2) NOT NULL,
+                total_amount NUMERIC(10, 2) NOT NULL,
+                payment_method TEXT NOT NULL DEFAULT 'Cash',
+                payment_ref TEXT,
+                sale_date DATE NOT NULL DEFAULT CURRENT_DATE
+            );
+            """
+        )
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS reservations (
@@ -256,7 +299,7 @@ def get_editable_columns(table_name, id_col):
         WHERE table_schema = 'public'
           AND table_name = %s
           AND column_name NOT IN (%s, 'password_hash')
-          AND (column_default IS NULL OR column_name = 'stock')
+          AND (column_default IS NULL OR column_name IN ('stock', 'selling_price'))
         ORDER BY ordinal_position;
         """,
         (table_name, id_col),
@@ -277,7 +320,13 @@ def render_field_input(col_name, data_type, current_val=None, widget_key=None):
         )
     elif data_type in ("numeric", "decimal", "real", "double precision"):
         default_float = float(current_val) if current_val is not None else 0.0
-        return st.number_input(label, step=0.01, value=default_float, key=widget_key)
+        return st.number_input(
+            label,
+            step=10.0 if col_name == "selling_price" else 0.01,
+            min_value=0.0 if col_name == "selling_price" else None,
+            value=default_float,
+            key=widget_key,
+        )
     elif data_type == "date":
         default_date = current_val if current_val is not None else date.today()
         return st.date_input(label, value=default_date, key=widget_key)
@@ -487,6 +536,13 @@ all_rentals, _ = fetch_table(
     ORDER BY rental_id DESC;
     """
 )
+all_sales, _ = fetch_table(
+    """
+    SELECT sale_id, book_id, customer_id, quantity, unit_price, total_amount, payment_method, payment_ref, sale_date
+    FROM sales
+    ORDER BY sale_id DESC;
+    """
+)
 all_reservations, _ = fetch_table(
     """
     SELECT reservation_id, book_id, customer_id, reserved_date, status
@@ -527,6 +583,7 @@ if st.session_state["role"] == "customer":
     my_active = [r for r in my_rentals if r[4] is None]
     my_overdue = [r for r in my_active if r[5] is not None and r[5] < today]
     my_total_fees = sum(calculate_late_fee(r[4], r[5], daily_late_fee) for r in my_active)
+    my_sales = [s for s in all_sales if s[2] == cust["id"]]
     my_reservations = [res for res in all_reservations if res[2] == cust["id"]]
     my_pending_book_ids = {res[1] for res in my_reservations if res[4] == "Pending"}
 
@@ -540,15 +597,21 @@ if st.session_state["role"] == "customer":
             f"Current accrued late fees: {currency} {my_total_fees:,.2f} ({currency} {daily_late_fee:,.2f}/day)."
         )
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("My Active Rentals", len(my_active))
     c2.metric("My Overdue Books", len(my_overdue))
     c3.metric("Accrued Late Fees", f"{currency} {my_total_fees:,.2f}")
     c4.metric("Pending Reservations", len(my_pending_book_ids))
+    c5.metric("Books Purchased", sum(int(s[3]) for s in my_sales))
 
     st.divider()
-    tab_my_rentals, tab_catalog, tab_my_res = st.tabs(
-        ["My Borrowed Books & Due Dates", "Browse & Reserve Books", "My Reservations"]
+    tab_my_rentals, tab_catalog, tab_my_res, tab_my_purchases = st.tabs(
+        [
+            "My Borrowed Books & Due Dates",
+            "Browse & Reserve Books",
+            "My Reservations",
+            "My Purchase History",
+        ]
     )
 
     with tab_my_rentals:
@@ -576,11 +639,13 @@ if st.session_state["role"] == "customer":
             physical_stock = row_dict.get("stock", 0)
             reserved_holds = pending_res_by_book.get(book_id, 0)
             net_available = max(0, physical_stock - reserved_holds)
+            price_val = float(row_dict.get("selling_price", 0))
 
             clean_row = dict(row_dict)
+            clean_row[f"Buy Price ({currency})"] = f"{price_val:,.2f}" if price_val > 0 else "Ask Staff"
             clean_row["Reserved Holds"] = reserved_holds
             clean_row["Availability"] = (
-                f"Available ({net_available} ready to reserve)"
+                f"Available ({net_available} ready)"
                 if net_available > 0
                 else "Unavailable / All Copies Held"
             )
@@ -650,6 +715,25 @@ if st.session_state["role"] == "customer":
         else:
             st.info("You have not reserved any books yet.")
 
+    with tab_my_purchases:
+        if my_sales:
+            sales_table = [
+                {
+                    "Sale ID": s[0],
+                    "Date": s[8],
+                    "Book Title": book_names.get(s[1], f"Book #{s[1]}"),
+                    "Qty": s[3],
+                    f"Unit Price ({currency})": f"{float(s[4]):,.2f}",
+                    f"Total Paid ({currency})": f"{float(s[5]):,.2f}",
+                    "Payment Method": s[6],
+                    "Reference": s[7] or "N/A",
+                }
+                for s in my_sales
+            ]
+            st.dataframe(sales_table, hide_index=True, use_container_width=True)
+        else:
+            st.info("You have no retail book purchases yet.")
+
     st.stop()
 
 # ==============================================================================
@@ -715,11 +799,11 @@ def render_edit_row_form(table_name, id_col, raw_rows, dict_rows, form_key, expa
 
 active_rentals = [r for r in all_rentals if r[4] is None]
 overdue_rentals = [r for r in active_rentals if r[5] is not None and r[5] < today]
-returned_count = len(all_rentals) - len(active_rentals)
 total_copies_in_stock = sum(d.get("stock", 0) for d in books_data)
 total_active_late_fees = sum(
     calculate_late_fee(r[4], r[5], daily_late_fee) for r in overdue_rentals
 )
+total_sales_revenue = sum(float(s[5]) for s in all_sales)
 available_books = [(raw, d) for raw, d in zip(book_rows, books_data) if d.get("stock", 0) > 0]
 
 # --- OVERDUE ALERTS & AUTOMATED EMAIL/SMS REMINDERS ---
@@ -735,7 +819,7 @@ if overdue_rentals:
         + "\n".join(f"- {item}" for item in alert_items)
     )
 
-    with st.expander("Send AutomatedOverdue Email / SMS Reminder"):
+    with st.expander("Send Automated Overdue Email / SMS Reminder"):
         selected_overdue = st.selectbox(
             "Select Overdue Rental to Notify",
             overdue_rentals,
@@ -779,25 +863,30 @@ if overdue_rentals:
 m1, m2, m3, m4, m5, m6, m7 = st.columns(7)
 m1.metric("Book Titles", len(book_rows))
 m2.metric("Copies in Stock", total_copies_in_stock)
-m3.metric("Customers", len(customer_rows))
-m4.metric("Active Rentals", len(active_rentals))
-m5.metric("Overdue", len(overdue_rentals))
-m6.metric("Pending Pickups", len(pending_reservations))
-m7.metric("Active Late Fees", f"{currency} {total_active_late_fees:,.2f}")
+m3.metric("Active Rentals", len(active_rentals))
+m4.metric("Overdue", len(overdue_rentals))
+m5.metric("Pending Pickups", len(pending_reservations))
+m6.metric("Active Late Fees", f"{currency} {total_active_late_fees:,.2f}")
+m7.metric("Retail Revenue", f"{currency} {total_sales_revenue:,.2f}")
 
-# --- PRINTABLE PDF RECEIPT BANNER (AFTER CHECKOUT OR RETURN) ---
+# --- PRINTABLE PDF RECEIPT BANNER (AFTER SALE, CHECKOUT, OR RETURN) ---
 if st.session_state.get("last_receipt"):
     rec = st.session_state["last_receipt"]
+    summary_suffix = (
+        f" — Total Paid: *{rec['currency']} {rec['total_amount']:,.2f}* via *{rec['payment_method']}*"
+        if rec["type"] == "Sale"
+        else f" (Rental #{rec['record_id']})"
+    )
     st.success(
         f"*{rec['type']} Recorded* for *{rec['customer_name']}* — "
-        f"{rec['book_title']} (Rental #{rec['rental_id']})."
+        f"{rec['book_title']}{summary_suffix}."
     )
     col_pdf_dl, col_pdf_dismiss = st.columns([3, 1])
     with col_pdf_dl:
         st.download_button(
             f"Download {rec['type']} Receipt (PDF)",
             data=build_receipt_pdf(rec),
-            file_name=f"receipt_rental_{rec['rental_id']}_{rec['type'].lower()}.pdf",
+            file_name=f"receipt_{rec['receipt_no'].lower()}.pdf",
             mime="application/pdf",
             type="primary",
         )
@@ -852,7 +941,7 @@ if pending_reservations:
                                 "receipt_no": f"CHK-{new_rid}",
                                 "type": "Checkout",
                                 "issued_date": str(today),
-                                "rental_id": new_rid,
+                                "record_id": new_rid,
                                 "customer_id": selected_res[2],
                                 "customer_name": customer_names.get(selected_res[2], f"Customer #{selected_res[2]}"),
                                 "book_id": selected_res[1],
@@ -876,8 +965,8 @@ if pending_reservations:
 
 st.divider()
 
-# --- SECTION 1: Check Out (with Due Date) & Return Forms ---
-col_checkout, col_return = st.columns(2)
+# --- SECTION 1: Front-Desk Operations (Check Out, Return & Retail POS Sale) ---
+col_checkout, col_return, col_pos = st.columns(3)
 
 with col_checkout:
     st.subheader("Check Out a Book")
@@ -886,7 +975,7 @@ with col_checkout:
             selected_book = st.selectbox(
                 "Select Available Book",
                 available_books,
-                format_func=lambda item: f"{item[0][0]} - {item[0][1]} (In stock: {item[1].get('stock', 0)})",
+                format_func=lambda item: f"{item[0][0]} - {item[0][1]} (Stock: {item[1].get('stock', 0)})",
             )
             selected_customer = st.selectbox(
                 "Select Customer",
@@ -918,7 +1007,7 @@ with col_checkout:
                                 "receipt_no": f"CHK-{new_rid}",
                                 "type": "Checkout",
                                 "issued_date": str(today),
-                                "rental_id": new_rid,
+                                "record_id": new_rid,
                                 "customer_id": selected_customer[0],
                                 "customer_name": selected_customer[1],
                                 "book_id": book_id,
@@ -944,7 +1033,7 @@ with col_return:
                 "Select Active Rental",
                 active_rentals,
                 format_func=lambda r: (
-                    f"Rental #{r[0]}: {book_names.get(r[1], f'Book #{r[1]}')} — "
+                    f"#{r[0]}: {book_names.get(r[1], f'Book #{r[1]}')} — "
                     f"{customer_names.get(r[2], f'Customer #{r[2]}')} | "
                     f"Fee: {currency} {calculate_late_fee(None, r[5], daily_late_fee):,.2f}"
                 ),
@@ -967,7 +1056,7 @@ with col_return:
                                 "receipt_no": f"RET-{selected_rental[0]}",
                                 "type": "Return",
                                 "issued_date": str(today),
-                                "rental_id": selected_rental[0],
+                                "record_id": selected_rental[0],
                                 "customer_id": selected_rental[2],
                                 "customer_name": customer_names.get(selected_rental[2], f"Customer #{selected_rental[2]}"),
                                 "book_id": selected_rental[1],
@@ -983,8 +1072,99 @@ with col_return:
     else:
         st.info("No active unreturned rentals right now.")
 
+with col_pos:
+    st.subheader("Sell a Book (POS)")
+    if available_books:
+        buyer_options = [None] + list(customer_rows)
+        with st.form("pos_sale_form", clear_on_submit=True):
+            sale_book = st.selectbox(
+                "Select Book to Sell",
+                available_books,
+                format_func=lambda item: (
+                    f"{item[0][0]} - {item[0][1]} "
+                    f"({currency} {float(item[1].get('selling_price', 0)):,.2f} | Stock: {item[1].get('stock', 0)})"
+                ),
+            )
+            sale_qty = st.number_input("Quantity", min_value=1, step=1, value=1)
+            sale_buyer = st.selectbox(
+                "Customer (Optional)",
+                buyer_options,
+                format_func=lambda row: "Walk-in Customer" if row is None else f"{row[0]} - {row[1]}",
+            )
+            pay_method = st.selectbox(
+                "Payment Method",
+                ["M-Pesa", "Cash", "Card", "Bank Transfer"],
+            )
+            pay_ref = st.text_input(
+                "Payment Ref / M-Pesa Code (Optional)",
+                placeholder="e.g. QK789XYZ or Cash",
+            ).strip()
+            custom_unit_price = st.number_input(
+                f"Custom Unit Price ({currency}, 0 = catalog price)",
+                min_value=0.0,
+                step=50.0,
+                value=0.0,
+            )
+            if st.form_submit_button("Complete Sale", type="primary"):
+                book_id = sale_book[1]["book_id"]
+                catalog_price = float(sale_book[1].get("selling_price", 0))
+                final_unit_price = custom_unit_price if custom_unit_price > 0 else catalog_price
+                total_paid = round(final_unit_price * int(sale_qty), 2)
+                buyer_id = sale_buyer[0] if sale_buyer is not None else None
+                buyer_name = sale_buyer[1] if sale_buyer is not None else "Walk-in Customer"
+
+                with psycopg.connect(DB_URL) as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "UPDATE books SET stock = stock - %s WHERE book_id = %s AND stock >= %s RETURNING stock;",
+                            (int(sale_qty), book_id, int(sale_qty)),
+                        )
+                        if cur.fetchone() is None:
+                            st.error("Insufficient stock available for that quantity.")
+                        else:
+                            cur.execute(
+                                """
+                                INSERT INTO sales (
+                                    book_id, customer_id, quantity, unit_price, total_amount,
+                                    payment_method, payment_ref, sale_date
+                                )
+                                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                                RETURNING sale_id;
+                                """,
+                                (
+                                    book_id,
+                                    buyer_id,
+                                    int(sale_qty),
+                                    final_unit_price,
+                                    total_paid,
+                                    pay_method,
+                                    pay_ref or None,
+                                    today,
+                                ),
+                            )
+                            new_sale_id = cur.fetchone()[0]
+                            st.session_state["last_receipt"] = {
+                                "receipt_no": f"SAL-{new_sale_id}",
+                                "type": "Sale",
+                                "issued_date": str(today),
+                                "record_id": new_sale_id,
+                                "customer_id": buyer_id,
+                                "customer_name": buyer_name,
+                                "book_id": book_id,
+                                "book_title": sale_book[0][1],
+                                "quantity": int(sale_qty),
+                                "unit_price": final_unit_price,
+                                "total_amount": total_paid,
+                                "payment_method": pay_method,
+                                "payment_ref": pay_ref or None,
+                                "currency": currency,
+                            }
+                            st.rerun()
+    else:
+        st.warning("No books in stock to sell.")
+
 # --- LATE FEE RATE CONFIGURATION ---
-with st.expander(f"Late Fee Settings (Current: {currency} {daily_late_fee:,.2f} / day)"):
+with st.expander(f"Store & Late Fee Settings (Current: {currency} {daily_late_fee:,.2f} / day)"):
     with st.form("late_fee_settings_form"):
         col_curr, col_rate = st.columns(2)
         with col_curr:
@@ -993,7 +1173,7 @@ with st.expander(f"Late Fee Settings (Current: {currency} {daily_late_fee:,.2f} 
             new_rate = st.number_input(
                 "Daily Overdue Rate", min_value=0.0, step=5.0, value=daily_late_fee
             )
-        if st.form_submit_button("Update Late Fee Settings"):
+        if st.form_submit_button("Update Store Settings"):
             with psycopg.connect(DB_URL) as conn:
                 with conn.cursor() as cur:
                     cur.execute(
@@ -1002,10 +1182,17 @@ with st.expander(f"Late Fee Settings (Current: {currency} {daily_late_fee:,.2f} 
                     )
             st.rerun()
 
-# --- SECTION 2: Database Explorer, Analytics & CSV Exports ---
+# --- SECTION 2: Database Explorer, Sales Ledger, Analytics & CSV Exports ---
 st.subheader("Database Explorer & Reports")
-tab_rentals, tab_analytics, tab_books, tab_customers, tab_logs = st.tabs(
-    ["Live Rentals (View)", "Analytics", "Books", "Customers", "Audit Logs (Trigger)"]
+tab_rentals, tab_sales, tab_analytics, tab_books, tab_customers, tab_logs = st.tabs(
+    [
+        "Live Rentals (View)",
+        "Sales & Payments",
+        "Analytics",
+        "Books",
+        "Customers",
+        "Audit Logs (Trigger)",
+    ]
 )
 
 with tab_rentals:
@@ -1076,7 +1263,7 @@ with tab_rentals:
                 "receipt_no": f"RPT-{reprint_rental[0]}",
                 "type": "Return" if reprint_rental[4] else "Checkout",
                 "issued_date": str(today),
-                "rental_id": reprint_rental[0],
+                "record_id": reprint_rental[0],
                 "customer_id": reprint_rental[2],
                 "customer_name": customer_names.get(reprint_rental[2], f"Customer #{reprint_rental[2]}"),
                 "book_id": reprint_rental[1],
@@ -1084,6 +1271,7 @@ with tab_rentals:
                 "borrow_date": str(reprint_rental[3]),
                 "due_date": str(reprint_rental[5]) if reprint_rental[5] else "N/A",
                 "return_date": str(reprint_rental[4]) if reprint_rental[4] else "Not yet returned",
+                "status": format_rental_status(reprint_rental[4], reprint_rental[4] else ,"Not yet returned",
                 "status": format_rental_status(reprint_rental[4], reprint_rental[5]),
                 "currency": currency,
                 "late_fee": calculate_late_fee(reprint_rental[4], reprint_rental[5], daily_late_fee),
@@ -1136,46 +1324,205 @@ with tab_rentals:
                         except Exception as e:
                             st.error(f"Could not delete rental: {e}")
 
+with tab_sales:
+    todays_sales_total = sum(float(s[5]) for s in all_sales if s[8] == today)
+    mpesa_total = sum(float(s[5]) for s in all_sales if s[6] == "M-Pesa")
+    cash_total = sum(float(s[5]) for s in all_sales if s[6] == "Cash")
+    units_sold = sum(int(s[3]) for s in all_sales)
+
+    s1, s2, s3, s4 = st.columns(4)
+    s1.metric("Today's Sales", f"{currency} {todays_sales_total:,.2f}")
+    s2.metric("M-Pesa Total", f"{currency} {mpesa_total:,.2f}")
+    s3.metric("Cash Total", f"{currency} {cash_total:,.2f}")
+    s4.metric("Total Books Sold", units_sold)
+
+    enriched_sales = [
+        {
+            "sale_id": s[0],
+            "sale_date": s[8],
+            "book_title": book_names.get(s[1], f"Book #{s[1]}"),
+            "customer": customer_names.get(s[2], "Walk-in Customer") if s[2] else "Walk-in Customer",
+            "quantity": s[3],
+            f"unit_price_{currency}": float(s[4]),
+            f"total_{currency}": float(s[5]),
+            "payment_method": s[6],
+            "payment_ref": s[7] or "",
+        }
+        for s in all_sales
+    ]
+
+    sales_search = (
+        st.text_input(
+            "Search Sales Ledger",
+            placeholder="Filter by book title, customer, M-Pesa ref, payment method, or date...",
+        )
+        .strip()
+        .lower()
+    )
+    filtered_sales = [
+        row
+        for row in enriched_sales
+        if not sales_search or any(sales_search in str(val).lower() for val in row.values())
+    ]
+
+    st.dataframe(filtered_sales, hide_index=True, use_container_width=True)
+    st.download_button(
+        "Download Sales Ledger CSV",
+        data=to_csv_bytes(filtered_sales),
+        file_name=f"sales_ledger_{today}.csv",
+        mime="text/csv",
+        disabled=not filtered_sales,
+    )
+
+    if all_sales:
+        col_s_pdf, col_s_del = st.columns(2)
+        with col_s_pdf:
+            with st.expander("Reprint PDF Receipt for Any Sale"):
+                reprint_sale = st.selectbox(
+                    "Select Sale for PDF Receipt",
+                    all_sales,
+                    format_func=lambda s: (
+                        f"Sale #{s[0]}: {book_names.get(s[1], f'Book #{s[1]}')} x{s[3]} — "
+                        f"{currency} {float(s[5]):,.2f} ({s[6]} | {s[8]})"
+                    ),
+                )
+                sale_pdf_payload = {
+                    "receipt_no": f"SAL-{reprint_sale[0]}",
+                    "type": "Sale",
+                    "issued_date": str(today),
+                    "record_id": reprint_sale[0],
+                    "customer_id": reprint_sale[2],
+                    "customer_name": (
+                        customer_names.get(reprint_sale[2], f"Customer #{reprint_sale[2]}")
+                        if reprint_sale[2]
+                        else "Walk-in Customer"
+                    ),
+                    "book_id": reprint_sale[1],
+                    "book_title": book_names.get(reprint_sale[1], f"Book #{reprint_sale[1]}"),
+                    "quantity": int(reprint_sale[3]),
+                    "unit_price": float(reprint_sale[4]),
+                    "total_amount": float(reprint_sale[5]),
+                    "payment_method": reprint_sale[6],
+                    "payment_ref": reprint_sale[7],
+                    "currency": currency,
+                }
+                st.download_button(
+                    "Download Selected Sale Receipt (PDF)",
+                    data=build_receipt_pdf(sale_pdf_payload),
+                    file_name=f"receipt_sal-{reprint_sale[0]}.pdf",
+                    mime="application/pdf",
+                )
+
+        with col_s_del:
+            with st.expander("Void / Delete a Sale Record"):
+                with st.form("delete_sale_form"):
+                    sale_to_delete = st.selectbox(
+                        "Select Sale to Void",
+                        all_sales,
+                        format_func=lambda s: (
+                            f"Sale #{s[0]}: {book_names.get(s[1], f'Book #{s[1]}')} x{s[3]} — "
+                            f"{currency} {float(s[5]):,.2f} ({s[6]})"
+                        ),
+                    )
+                    confirm_sale_del = st.checkbox("Confirm permanent deletion of this sale")
+                    restore_sale_stock = st.checkbox(
+                        "Return sold copies back to book inventory stock", value=True
+                    )
+                    if st.form_submit_button("Void Sale", type="primary"):
+                        if not confirm_sale_del:
+                            st.warning("Please tick the confirmation box first.")
+                        else:
+                            with psycopg.connect(DB_URL) as conn:
+                                with conn.cursor() as cur:
+                                    cur.execute(
+                                        "DELETE FROM sales WHERE sale_id = %s;",
+                                        (sale_to_delete[0],),
+                                    )
+                                    if restore_sale_stock:
+                                        cur.execute(
+                                            "UPDATE books SET stock = stock + %s WHERE book_id = %s;",
+                                            (int(sale_to_delete[3]), sale_to_delete[1]),
+                                        )
+                            st.rerun()
+
 with tab_analytics:
-    if not all_rentals:
-        st.info("Record at least one rental to generate bookstore analytics charts.")
+    if not all_rentals and not all_sales:
+        st.info("Record at least one rental or sale to generate bookstore analytics charts.")
     else:
         chart_col1, chart_col2 = st.columns(2)
 
         with chart_col1:
             st.markdown("*Most Borrowed Books*")
-            book_counts = {}
-            for r in all_rentals:
-                title = book_names.get(r[1], f"Book #{r[1]}")
-                book_counts[title] = book_counts.get(title, 0) + 1
-            top_books_chart = [
-                {"Book Title": title, "Total Rentals": count}
-                for title, count in sorted(book_counts.items(), key=lambda x: x[1], reverse=True)[:10]
-            ]
-            st.bar_chart(top_books_chart, x="Book Title", y="Total Rentals")
+            if all_rentals:
+                book_counts = {}
+                for r in all_rentals:
+                    title = book_names.get(r[1], f"Book #{r[1]}")
+                    book_counts[title] = book_counts.get(title, 0) + 1
+                top_books_chart = [
+                    {"Book Title": title, "Total Rentals": count}
+                    for title, count in sorted(book_counts.items(), key=lambda x: x[1], reverse=True)[:10]
+                ]
+                st.bar_chart(top_books_chart, x="Book Title", y="Total Rentals")
+            else:
+                st.info("No rental data yet.")
 
         with chart_col2:
-            st.markdown("*Top Customers by Rentals*")
-            cust_counts = {}
-            for r in all_rentals:
-                cname = customer_names.get(r[2], f"Customer #{r[2]}")
-                cust_counts[cname] = cust_counts.get(cname, 0) + 1
-            top_cust_chart = [
-                {"Customer": cname, "Total Rentals": count}
-                for cname, count in sorted(cust_counts.items(), key=lambda x: x[1], reverse=True)[:10]
-            ]
-            st.bar_chart(top_cust_chart, x="Customer", y="Total Rentals")
+            st.markdown(f"*Retail Revenue by Payment Method ({currency})*")
+            if all_sales:
+                pay_totals = {}
+                for s in all_sales:
+                    pm = s[6] or "Other"
+                    pay_totals[pm] = pay_totals.get(pm, 0.0) + float(s[5])
+                pay_chart = [
+                    {"Payment Method": pm, f"Revenue ({currency})": amt}
+                    for pm, amt in sorted(pay_totals.items(), key=lambda x: x[1], reverse=True)
+                ]
+                st.bar_chart(pay_chart, x="Payment Method", y=f"Revenue ({currency})")
+            else:
+                st.info("No retail sales data yet.")
 
-        st.markdown("*Checkout Activity Over Time*")
-        daily_counts = {}
-        for r in all_rentals:
-            b_date = str(r[3])
-            daily_counts[b_date] = daily_counts.get(b_date, 0) + 1
-        trend_chart = [
-            {"Borrow Date": d_str, "Checkouts": count}
-            for d_str, count in sorted(daily_counts.items())
-        ]
-        st.line_chart(trend_chart, x="Borrow Date", y="Checkouts")
+        chart_col3, chart_col4 = st.columns(2)
+        with chart_col3:
+            st.markdown(f"*Top Selling Books by Revenue ({currency})*")
+            if all_sales:
+                sales_by_book = {}
+                for s in all_sales:
+                    title = book_names.get(s[1], f"Book #{s[1]}")
+                    sales_by_book[title] = sales_by_book.get(title, 0.0) + float(s[5])
+                top_sold_chart = [
+                    {"Book Title": title, f"Revenue ({currency})": rev}
+                    for title, rev in sorted(sales_by_book.items(), key=lambda x: x[1], reverse=True)[:10]
+                ]
+                st.bar_chart(top_sold_chart, x="Book Title", y=f"Revenue ({currency})")
+            else:
+                st.info("No retail sales data yet.")
+
+        with chart_col4:
+            st.markdown("*Top Customers by Rentals*")
+            if all_rentals:
+                cust_counts = {}
+                for r in all_rentals:
+                    cname = customer_names.get(r[2], f"Customer #{r[2]}")
+                    cust_counts[cname] = cust_counts.get(cname, 0) + 1
+                top_cust_chart = [
+                    {"Customer": cname, "Total Rentals": count}
+                    for cname, count in sorted(cust_counts.items(), key=lambda x: x[1], reverse=True)[:10]
+                ]
+                st.bar_chart(top_cust_chart, x="Customer", y="Total Rentals")
+            else:
+                st.info("No rental data yet.")
+
+        if all_rentals:
+            st.markdown("*Checkout Activity Over Time*")
+            daily_counts = {}
+            for r in all_rentals:
+                b_date = str(r[3])
+                daily_counts[b_date] = daily_counts.get(b_date, 0) + 1
+            trend_chart = [
+                {"Borrow Date": d_str, "Checkouts": count}
+                for d_str, count in sorted(daily_counts.items())
+            ]
+            st.line_chart(trend_chart, x="Borrow Date", y="Checkouts")
 
 with tab_books:
     if "isbn_prefill" not in st.session_state:
@@ -1187,7 +1534,7 @@ with tab_books:
             with st.form("isbn_lookup_form"):
                 scanned_isbn = st.text_input(
                     "Scan Barcode or Enter ISBN-10 / ISBN-13",
-                    placeholder="e.g. 9780735211292",
+                    placeholder="e.g. 9780385474542",
                 )
                 if st.form_submit_button("Auto-Fill from Open Library"):
                     fetched_meta, err_msg = lookup_isbn_metadata(scanned_isbn)
@@ -1219,7 +1566,7 @@ with tab_books:
             book_rows,
             books_data,
             "edit_book_form",
-            "Edit Book Details / Stock",
+            "Edit Book Details / Stock / Price",
         )
 
     st.dataframe(books_data, hide_index=True, use_container_width=True)
@@ -1253,7 +1600,7 @@ with tab_books:
                                     )
                             st.rerun()
                         except psycopg.errors.ForeignKeyViolation:
-                            st.error("Cannot delete this book because it still has rental records. Delete its rentals first.")
+                            st.error("Cannot delete this book because it has rental or sales history. Delete those records first.")
                         except Exception as e:
                             st.error(f"Could not delete book: {e}")
 
@@ -1330,7 +1677,7 @@ with tab_customers:
                                         )
                                 st.rerun()
                             except psycopg.errors.ForeignKeyViolation:
-                                st.error("Cannot delete this customer because they still have rental records. Delete their rentals first.")
+                                st.error("Cannot delete this customer because they have rental or sales records. Delete those records first.")
                             except Exception as e:
                                 st.error(f"Could not delete customer: {e}")
 
