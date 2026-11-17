@@ -919,7 +919,7 @@ if pending_reservations:
                 decline_btn = st.form_submit_button("Cancel Reservation")
 
             if approve_btn:
-                with psycopg.connect(DB_URL) as conn:
+                with psycogy.connect(DB_URL) as conn:
                     with conn.cursor() as cur:
                         cur.execute(
                             "UPDATE books SET stock = stock - 1 WHERE book_id = %s AND stock > 0 RETURNING stock;",
@@ -1252,14 +1252,13 @@ with tab_rentals:
     if all_rentals:
         with st.expander("Reprint PDF Receipt for Any Rental"):
             reprint_rental = st.selectbox(
-                "Select Rental for PDF Receipt",)
-                
-            all_rentals,
-            format_func=lambda r: (
+                "Select Rental for PDF Receipt",
+                all_rentals,
+                format_func=lambda r: (
                     f"Rental #{r[0]}: {book_names.get(r[1], f'Book #{r[1]}')} — "
                     f"{customer_names.get(r[2], f'Customer #{r[2]}')} ({format_rental_status(r[4], r[5])})"
                 ),
-            
+            )
             reprint_payload = {
                 "receipt_no": f"RPT-{reprint_rental[0]}",
                 "type": "Return" if reprint_rental[4] else "Checkout",
@@ -1272,7 +1271,6 @@ with tab_rentals:
                 "borrow_date": str(reprint_rental[3]),
                 "due_date": str(reprint_rental[5]) if reprint_rental[5] else "N/A",
                 "return_date": str(reprint_rental[4]) if reprint_rental[4] else "Not yet returned",
-               
                 "status": format_rental_status(reprint_rental[4], reprint_rental[5]),
                 "currency": currency,
                 "late_fee": calculate_late_fee(reprint_rental[4], reprint_rental[5], daily_late_fee),
