@@ -1258,7 +1258,7 @@ with tab_rentals:
                     f"Rental #{r[0]}: {book_names.get(r[1], f'Book #{r[1]}')} — "
                     f"{customer_names.get(r[2], f'Customer #{r[2]}')} ({format_rental_status(r[4], r[5])})"
                 ),
-            )
+            
             reprint_payload = {
                 "receipt_no": f"RPT-{reprint_rental[0]}",
                 "type": "Return" if reprint_rental[4] else "Checkout",
