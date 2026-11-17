@@ -818,8 +818,9 @@ if st.session_state["role"] == "customer":
                             )
                     st.success("Thank you! Your review has been published.")
                     st.rerun()
-                    if all_reviews:
-                      reviews_table = [
+      reviews_table = []
+        if all_reviews:
+            reviews_table = [
                 {
                     "Book Title": book_names.get(rev[1], f"Book #{rev[1]}"),
                     "Reader": customer_names.get(rev[2], f"Customer #{rev[2]}"),
@@ -829,9 +830,10 @@ if st.session_state["role"] == "customer":
                 }
                 for rev in all_reviews
             ]
+        if reviews_table:
             st.dataframe(reviews_table, hide_index=True, use_container_width=True)
         else:
-            st.info("No reader reviews yet. Be the first to rate a book above!")
+            st.info("No reader reviews yet. Be the first to rate a book above!")         
 
     with tab_my_purchases:
         if my_sales:
