@@ -1252,7 +1252,7 @@ with tab_rentals:
     if all_rentals:
         with st.expander("Reprint PDF Receipt for Any Rental"):
             reprint_rental = st.selectbox(
-                "Select Rental for PDF Receipt",
+                "Select Rental for PDF Receipt",)
                 all_rentals,
                 format_func=lambda r: (
                     f"Rental #{r[0]}: {book_names.get(r[1], f'Book #{r[1]}')} — "
