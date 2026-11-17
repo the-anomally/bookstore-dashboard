@@ -38,6 +38,13 @@ def to_csv_bytes(dict_rows):
     return output.getvalue().encode("utf-8")
 
 
+def isbn_to_cover_url(raw_isbn):
+    if not raw_isbn:
+        return None
+    cleaned = "".join(ch for ch in str(raw_isbn) if ch.isalnum()).upper()
+    return f"https://covers.openlibrary.org/b/isbn/{cleaned}-M.jpg" if cleaned else None
+
+
 # --- PASSWORD HASHING HELPERS (INDIVIDUAL CUSTOMER ACCOUNTS) ---
 def hash_password(plain_password):
     salt = os.urandom(16)
@@ -78,6 +85,7 @@ def lookup_isbn_metadata(raw_isbn):
             "title": title,
             "author": authors,
             "publisher": publishers,
+            "cover_url": isbn_to_cover_url(cleaned),
         }, None
     except Exception as e:
         return None, f"ISBN lookup failed: {e}"
@@ -234,7 +242,7 @@ def send_sms_reminder(phone_number, message_text):
         return False, f"SMS failed: {e}"
 
 
-# Ensure schema extensions, retail sales table, reservations, and settings exist
+# Ensure schema extensions, retail sales, reviews, reservations, and settings exist
 with psycopg.connect(DB_URL) as conn:
     with conn.cursor() as cur:
         cur.execute("ALTER TABLE rentals ADD COLUMN IF NOT EXISTS return_date DATE;")
@@ -244,6 +252,7 @@ with psycopg.connect(DB_URL) as conn:
         cur.execute("ALTER TABLE books ADD COLUMN IF NOT EXISTS isbn TEXT;")
         cur.execute("ALTER TABLE books ADD COLUMN IF NOT EXISTS author TEXT;")
         cur.execute("ALTER TABLE books ADD COLUMN IF NOT EXISTS publisher TEXT;")
+        cur.execute("ALTER TABLE books ADD COLUMN IF NOT EXISTS cover_url TEXT;")
         cur.execute("ALTER TABLE customers ADD COLUMN IF NOT EXISTS email TEXT;")
         cur.execute("ALTER TABLE customers ADD COLUMN IF NOT EXISTS phone TEXT;")
         cur.execute("ALTER TABLE customers ADD COLUMN IF NOT EXISTS password_hash TEXT;")
@@ -270,6 +279,19 @@ with psycopg.connect(DB_URL) as conn:
                 customer_id INTEGER NOT NULL REFERENCES customers(customer_id),
                 reserved_date DATE NOT NULL DEFAULT CURRENT_DATE,
                 status TEXT NOT NULL DEFAULT 'Pending'
+            );
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS reviews (
+                review_id SERIAL PRIMARY KEY,
+                book_id INTEGER NOT NULL REFERENCES books(book_id) ON DELETE CASCADE,
+                customer_id INTEGER NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
+                rating INTEGER NOT NULL CHECK (rating BETWEEN 1 AND 5),
+                comment TEXT,
+                review_date DATE NOT NULL DEFAULT CURRENT_DATE,
+                UNIQUE (book_id, customer_id)
             );
             """
         )
@@ -358,6 +380,8 @@ def render_add_row_form(table_name, id_col, form_key, button_label, prefill=None
             )
         if st.form_submit_button(button_label):
             try:
+                if table_name == "books" and not values.get("cover_url") and values.get("isbn"):
+                    values["cover_url"] = isbn_to_cover_url(values["isbn"])
                 cols = list(values.keys())
                 query = sql.SQL("INSERT INTO {} ({}) VALUES ({});").format(
                     sql.Identifier(table_name),
@@ -550,6 +574,13 @@ all_reservations, _ = fetch_table(
     ORDER BY reservation_id DESC;
     """
 )
+all_reviews, _ = fetch_table(
+    """
+    SELECT review_id, book_id, customer_id, rating, comment, review_date
+    FROM reviews
+    ORDER BY review_id DESC;
+    """
+)
 
 book_names = {r[0]: r[1] for r in book_rows}
 customer_names = {r[0]: r[1] for r in customer_rows}
@@ -563,6 +594,10 @@ pending_reservations = [res for res in all_reservations if res[4] == "Pending"]
 pending_res_by_book = {}
 for res in pending_reservations:
     pending_res_by_book[res[1]] = pending_res_by_book.get(res[1], 0) + 1
+
+ratings_by_book = {}
+for rev in all_reviews:
+    ratings_by_book.setdefault(rev[1], []).append(int(rev[3]))
 
 # ==============================================================================
 # VIEW A: CUSTOMER PORTAL
@@ -605,14 +640,106 @@ if st.session_state["role"] == "customer":
     c5.metric("Books Purchased", sum(int(s[3]) for s in my_sales))
 
     st.divider()
-    tab_my_rentals, tab_catalog, tab_my_res, tab_my_purchases = st.tabs(
+    tab_catalog, tab_my_rentals, tab_my_res, tab_reviews, tab_my_purchases = st.tabs(
         [
-            "My Borrowed Books & Due Dates",
             "Browse & Reserve Books",
+            "My Borrowed Books & Due Dates",
             "My Reservations",
+            "Ratings & Reviews",
             "My Purchase History",
         ]
     )
+
+    with tab_catalog:
+        reservable_books = []
+        catalog_cards = []
+        for raw, row_dict in zip(book_rows, books_data):
+            book_id = row_dict["book_id"]
+            physical_stock = row_dict.get("stock", 0)
+            reserved_holds = pending_res_by_book.get(book_id, 0)
+            net_available = max(0, physical_stock - reserved_holds)
+            price_val = float(row_dict.get("selling_price", 0))
+            cover_img = row_dict.get("cover_url") or isbn_to_cover_url(row_dict.get("isbn"))
+            book_ratings = ratings_by_book.get(book_id, [])
+            avg_rating = (
+                f"{sum(book_ratings) / len(book_ratings):.1f}/5 ({len(book_ratings)})"
+                if book_ratings
+                else "No ratings yet"
+            )
+
+            card_item = {
+                "book_id": book_id,
+                "title": row_dict.get("title") or raw[1],
+                "author": row_dict.get("author") or "Author not listed",
+                "isbn": row_dict.get("isbn") or "",
+                "cover_url": cover_img,
+                "rating": avg_rating,
+                "price_label": f"{currency} {price_val:,.2f}" if price_val > 0 else "Ask Staff",
+                "net_available": net_available,
+                "availability": (
+                    f"Available ({net_available} ready)"
+                    if net_available > 0
+                    else "Unavailable / Held"
+                ),
+            }
+            catalog_cards.append(card_item)
+            if net_available > 0 and book_id not in my_pending_book_ids:
+                reservable_books.append((raw, net_available))
+
+        if reservable_books:
+            with st.form("customer_reserve_form", clear_on_submit=True):
+                chosen_res = st.selectbox(
+                    "Reserve a Copy for Pickup",
+                    reservable_books,
+                    format_func=lambda item: f"{item[0][0]} - {item[0][1]} ({item[1]} available)",
+                )
+                if st.form_submit_button("Reserve Copy", type="primary"):
+                    with psycopg.connect(DB_URL) as conn:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                "INSERT INTO reservations (book_id, customer_id, reserved_date, status) VALUES (%s, %s, %s, 'Pending');",
+                                (chosen_res[0][0], cust["id"], today),
+                            )
+                    st.rerun()
+        else:
+            st.info("No additional books are currently available to reserve.")
+
+        catalog_search = (
+            st.text_input("Search Book Catalog", placeholder="Search by title, author, ISBN...")
+            .strip()
+            .lower()
+        )
+        filtered_cards = [
+            c
+            for c in catalog_cards
+            if not catalog_search
+            or any(
+                catalog_search in str(c[k]).lower()
+                for k in ("title", "author", "isbn", "availability")
+            )
+        ]
+
+        if filtered_cards:
+            cols_per_row = 3
+            for idx in range(0, len(filtered_cards), cols_per_row):
+                row_cols = st.columns(cols_per_row)
+                for col_widget, book_card in zip(row_cols, filtered_cards[idx : idx + cols_per_row]):
+                    with col_widget:
+                        with st.container(border=True):
+                            c_img, c_info = st.columns([1, 2])
+                            with c_img:
+                                if book_card["cover_url"]:
+                                    st.image(book_card["cover_url"], use_container_width=True)
+                                else:
+                                    st.caption("No Cover")
+                            with c_info:
+                                st.markdown(f"*{book_card['title']}*")
+                                st.caption(book_card["author"])
+                                st.write(f"Rating: *{book_card['rating']}*")
+                                st.write(f"Buy: *{book_card['price_label']}*")
+                                st.write(f"Status: *{book_card['availability']}*")
+        else:
+            st.info("No matching books found.")
 
     with tab_my_rentals:
         if my_rentals:
@@ -630,58 +757,6 @@ if st.session_state["role"] == "customer":
             st.dataframe(my_table, hide_index=True, use_container_width=True)
         else:
             st.info("You have no rental history yet.")
-
-    with tab_catalog:
-        reservable_books = []
-        catalog_rows = []
-        for raw, row_dict in zip(book_rows, books_data):
-            book_id = row_dict["book_id"]
-            physical_stock = row_dict.get("stock", 0)
-            reserved_holds = pending_res_by_book.get(book_id, 0)
-            net_available = max(0, physical_stock - reserved_holds)
-            price_val = float(row_dict.get("selling_price", 0))
-
-            clean_row = dict(row_dict)
-            clean_row[f"Buy Price ({currency})"] = f"{price_val:,.2f}" if price_val > 0 else "Ask Staff"
-            clean_row["Reserved Holds"] = reserved_holds
-            clean_row["Availability"] = (
-                f"Available ({net_available} ready)"
-                if net_available > 0
-                else "Unavailable / All Copies Held"
-            )
-            catalog_rows.append(clean_row)
-            if net_available > 0 and book_id not in my_pending_book_ids:
-                reservable_books.append((raw, net_available))
-
-        if reservable_books:
-            with st.form("customer_reserve_form", clear_on_submit=True):
-                chosen_res = st.selectbox(
-                    "Reserve a Copy for Pickup",
-                    reservable_books,
-                    format_func=lambda item: f"{item[0][0]} - {item[0][1]} ({item[1]} available)",
-                )
-                if st.form_submit_button("Reserve Copy"):
-                    with psycopg.connect(DB_URL) as conn:
-                        with conn.cursor() as cur:
-                            cur.execute(
-                                "INSERT INTO reservations (book_id, customer_id, reserved_date, status) VALUES (%s, %s, %s, 'Pending');",
-                                (chosen_res[0][0], cust["id"], today),
-                            )
-                    st.rerun()
-        else:
-            st.info("No additional books are currently available to reserve.")
-
-        catalog_search = (
-            st.text_input("Search Book Catalog", placeholder="Search by title, author, ISBN...")
-            .strip()
-            .lower()
-        )
-        filtered_catalog = [
-            row
-            for row in catalog_rows
-            if not catalog_search or any(catalog_search in str(v).lower() for v in row.values())
-        ]
-        st.dataframe(filtered_catalog, hide_index=True, use_container_width=True)
 
     with tab_my_res:
         if my_reservations:
@@ -714,6 +789,49 @@ if st.session_state["role"] == "customer":
                         st.rerun()
         else:
             st.info("You have not reserved any books yet.")
+
+    with tab_reviews:
+        if book_rows:
+            with st.form("submit_review_form", clear_on_submit=True):
+                rev_book = st.selectbox(
+                    "Select Book to Rate / Review",
+                    book_rows,
+                    format_func=lambda r: f"{r[0]} - {r[1]}",
+                )
+                rev_rating = st.slider("Star Rating (1 = Poor, 5 = Masterpiece)", 1, 5, 5)
+                rev_comment = st.text_area(
+                    "Your Review (Optional)",
+                    placeholder="Share what you liked about this book...",
+                    height=80,
+                ).strip()
+                if st.form_submit_button("Post Review"):
+                    with psycopg.connect(DB_URL) as conn:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                """
+                                INSERT INTO reviews (book_id, customer_id, rating, comment, review_date)
+                                VALUES (%s, %s, %s, %s, %s)
+                                ON CONFLICT (book_id, customer_id)
+                                DO UPDATE SET rating = EXCLUDED.rating, comment = EXCLUDED.comment, review_date = EXCLUDED.review_date;
+                                """,
+                                (rev_book[0], cust["id"], int(rev_rating), rev_comment or None, today),
+                            )
+                    st.success("Thank you! Your review has been published.")
+                    st.rerun()
+                    if all_reviews:
+            reviews_table = [
+                {
+                    "Book Title": book_names.get(rev[1], f"Book #{rev[1]}"),
+                    "Reader": customer_names.get(rev[2], f"Customer #{rev[2]}"),
+                    "Rating": f"{rev[3]} / 5",
+                    "Review": rev[4] or "",
+                    "Date": rev[5],
+                }
+                for rev in all_reviews
+            ]
+            st.dataframe(reviews_table, hide_index=True, use_container_width=True)
+        else:
+            st.info("No reader reviews yet. Be the first to rate a book above!")
 
     with tab_my_purchases:
         if my_sales:
@@ -771,12 +889,14 @@ def render_edit_row_form(table_name, id_col, raw_rows, dict_rows, form_key, expa
                     col_name,
                     data_type,
                     current_val=selected_dict.get(col_name),
-                    widget_key=f"{form_key}{record_id}{col_name}",
+                    widget_key=f"{form_key}_{record_id}_{col_name}",
                 )
                 for col_name, data_type in col_rows
             }
             if st.form_submit_button("Save Changes"):
                 try:
+                    if table_name == "books" and not updated_values.get("cover_url") and updated_values.get("isbn"):
+                        updated_values["cover_url"] = isbn_to_cover_url(updated_values["isbn"])
                     cols = list(updated_values.keys())
                     assignments = sql.SQL(", ").join(
                         sql.SQL("{} = {}").format(sql.Identifier(c), sql.Placeholder())
@@ -809,13 +929,13 @@ available_books = [(raw, d) for raw, d in zip(book_rows, books_data) if d.get("s
 # --- OVERDUE ALERTS & AUTOMATED EMAIL/SMS REMINDERS ---
 if overdue_rentals:
     alert_items = [
-        f"Rental #{r[0]}: *{book_names.get(r[1], f'Book #{r[1]}')}* borrowed by "
-        f"*{customer_names.get(r[2], f'Customer #{r[2]}')}* (Due {r[5]} — {(today - r[5]).days} days overdue | "
-        f"Late Fee: *{currency} {calculate_late_fee(r[4], r[5], daily_late_fee):,.2f}*)"
+        f"Rental #{r[0]}: **{book_names.get(r[1], f'Book #{r[1]}')}** borrowed by "
+        f"**{customer_names.get(r[2], f'Customer #{r[2]}')}** (Due {r[5]} — {(today - r[5]).days} days overdue | "
+        f"Late Fee: **{currency} {calculate_late_fee(r[4], r[5], daily_late_fee):,.2f}**)"
         for r in overdue_rentals
     ]
     st.error(
-        f"*Overdue Alert ({len(overdue_rentals)} book(s) past due):*\n\n"
+        f"**Overdue Alert ({len(overdue_rentals)} book(s) past due):**\n\n"
         + "\n".join(f"- {item}" for item in alert_items)
     )
 
@@ -842,8 +962,8 @@ if overdue_rentals:
         )
         reminder_msg = st.text_area("Reminder Message", value=default_msg, height=90)
         st.caption(
-            f"Customer Contact on File — Email: {contact.get('email') or 'Not set'} | "
-            f"Phone: {contact.get('phone') or 'Not set'}"
+            f"Customer Contact on File — Email: `{contact.get('email') or 'Not set'}` | "
+            f"Phone: `{contact.get('phone') or 'Not set'}`"
         )
         col_send_email, col_send_sms = st.columns(2)
         with col_send_email:
@@ -873,13 +993,13 @@ m7.metric("Retail Revenue", f"{currency} {total_sales_revenue:,.2f}")
 if st.session_state.get("last_receipt"):
     rec = st.session_state["last_receipt"]
     summary_suffix = (
-        f" — Total Paid: *{rec['currency']} {rec['total_amount']:,.2f}* via *{rec['payment_method']}*"
+        f" — Total Paid: **{rec['currency']} {rec['total_amount']:,.2f}** via **{rec['payment_method']}**"
         if rec["type"] == "Sale"
         else f" (Rental #{rec['record_id']})"
     )
     st.success(
-        f"*{rec['type']} Recorded* for *{rec['customer_name']}* — "
-        f"{rec['book_title']}{summary_suffix}."
+        f"**{rec['type']} Recorded** for **{rec['customer_name']}** — "
+        f"*{rec['book_title']}*{summary_suffix}."
     )
     col_pdf_dl, col_pdf_dismiss = st.columns([3, 1])
     with col_pdf_dl:
@@ -919,7 +1039,7 @@ if pending_reservations:
                 decline_btn = st.form_submit_button("Cancel Reservation")
 
             if approve_btn:
-                with psycogy.connect(DB_URL) as conn:
+                with psycopg.connect(DB_URL) as conn:
                     with conn.cursor() as cur:
                         cur.execute(
                             "UPDATE books SET stock = stock - 1 WHERE book_id = %s AND stock > 0 RETURNING stock;",
@@ -1163,24 +1283,50 @@ with col_pos:
     else:
         st.warning("No books in stock to sell.")
 
-# --- LATE FEE RATE CONFIGURATION ---
-with st.expander(f"Store & Late Fee Settings (Current: {currency} {daily_late_fee:,.2f} / day)"):
-    with st.form("late_fee_settings_form"):
-        col_curr, col_rate = st.columns(2)
-        with col_curr:
+# --- STORE SETTINGS & PRE-LAUNCH TEST DATA RESET ---
+with st.expander(f"Store Settings & Pre-Launch Reset (Late Fee: {currency} {daily_late_fee:,.2f} / day)"):
+    col_set1, col_set2 = st.columns(2)
+    with col_set1:
+        with st.form("late_fee_settings_form"):
+            st.markdown("**Currency & Late Fee Rate**")
             new_currency = st.text_input("Currency Code / Symbol", value=currency).strip() or "KES"
-        with col_rate:
             new_rate = st.number_input(
                 "Daily Overdue Rate", min_value=0.0, step=5.0, value=daily_late_fee
             )
-        if st.form_submit_button("Update Store Settings"):
-            with psycopg.connect(DB_URL) as conn:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "UPDATE bookstore_settings SET currency = %s, daily_late_fee = %s WHERE id = 1;",
-                        (new_currency, new_rate),
-                    )
-            st.rerun()
+            if st.form_submit_button("Update Store Settings"):
+                with psycopg.connect(DB_URL) as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "UPDATE bookstore_settings SET currency = %s, daily_late_fee = %s WHERE id = 1;",
+                            (new_currency, new_rate),
+                        )
+                st.rerun()
+
+    with col_set2:
+        with st.form("reset_demo_data_form", clear_on_submit=True):
+            st.markdown("**Pre-Launch Test Data Reset**")
+            st.caption(
+                "Clears test rentals, sales, reservations, reviews, and audit logs "
+                "while keeping your books and customer accounts."
+            )
+            confirm_reset_box = st.checkbox("Confirm clearing all test transaction history")
+            reset_staff_pw = st.text_input("Re-enter Staff Password to Confirm", type="password")
+            if st.form_submit_button("Clear Test Transactions", type="primary"):
+                if not confirm_reset_box:
+                    st.warning("Please tick the confirmation box first.")
+                elif not hmac.compare_digest(reset_staff_pw, st.secrets["STAFF_PASSWORD"]):
+                    st.error("Incorrect staff password.")
+                else:
+                    with psycopg.connect(DB_URL) as conn:
+                        with conn.cursor() as cur:
+                            cur.execute("DELETE FROM rental_logs;")
+                            cur.execute("DELETE FROM rentals;")
+                            cur.execute("DELETE FROM sales;")
+                            cur.execute("DELETE FROM reservations;")
+                            cur.execute("DELETE FROM reviews;")
+                    st.session_state["last_receipt"] = None
+                    st.success("All test transactions cleared!")
+                    st.rerun()
 
 # --- SECTION 2: Database Explorer, Sales Ledger, Analytics & CSV Exports ---
 st.subheader("Database Explorer & Reports")
@@ -1451,7 +1597,7 @@ with tab_analytics:
         chart_col1, chart_col2 = st.columns(2)
 
         with chart_col1:
-            st.markdown("*Most Borrowed Books*")
+            st.markdown("**Most Borrowed Books**")
             if all_rentals:
                 book_counts = {}
                 for r in all_rentals:
@@ -1466,7 +1612,7 @@ with tab_analytics:
                 st.info("No rental data yet.")
 
         with chart_col2:
-            st.markdown(f"*Retail Revenue by Payment Method ({currency})*")
+            st.markdown(f"**Retail Revenue by Payment Method ({currency})**")
             if all_sales:
                 pay_totals = {}
                 for s in all_sales:
@@ -1482,7 +1628,7 @@ with tab_analytics:
 
         chart_col3, chart_col4 = st.columns(2)
         with chart_col3:
-            st.markdown(f"*Top Selling Books by Revenue ({currency})*")
+            st.markdown(f"**Top Selling Books by Revenue ({currency})**")
             if all_sales:
                 sales_by_book = {}
                 for s in all_sales:
@@ -1497,7 +1643,7 @@ with tab_analytics:
                 st.info("No retail sales data yet.")
 
         with chart_col4:
-            st.markdown("*Top Customers by Rentals*")
+            st.markdown("**Top Customers by Rentals**")
             if all_rentals:
                 cust_counts = {}
                 for r in all_rentals:
@@ -1512,7 +1658,7 @@ with tab_analytics:
                 st.info("No rental data yet.")
 
         if all_rentals:
-            st.markdown("*Checkout Activity Over Time*")
+            st.markdown("**Checkout Activity Over Time**")
             daily_counts = {}
             for r in all_rentals:
                 b_date = str(r[3])
@@ -1527,9 +1673,9 @@ with tab_books:
     if "isbn_prefill" not in st.session_state:
         st.session_state["isbn_prefill"] = {}
 
-    col_b_add, col_b_edit = st.columns(2)
+    col_b_add, col_b_edit, col_b_csv = st.columns(3)
     with col_b_add:
-        with st.expander("+ Add New Book (with ISBN Barcode Auto-Fill)", expanded=bool(st.session_state["isbn_prefill"])):
+        with st.expander("+ Add New Book (ISBN Auto-Fill)", expanded=bool(st.session_state["isbn_prefill"])):
             with st.form("isbn_lookup_form"):
                 scanned_isbn = st.text_input(
                     "Scan Barcode or Enter ISBN-10 / ISBN-13",
@@ -1546,7 +1692,7 @@ with tab_books:
             if st.session_state["isbn_prefill"]:
                 pf = st.session_state["isbn_prefill"]
                 st.info(
-                    f"Loaded ISBN {pf.get('isbn')}: *{pf.get('title')}* "
+                    f"Loaded ISBN {pf.get('isbn')}: **{pf.get('title')}** "
                     f"({pf.get('author') or 'Unknown author'})"
                 )
 
@@ -1568,7 +1714,105 @@ with tab_books:
             "Edit Book Details / Stock / Price",
         )
 
-    st.dataframe(books_data, hide_index=True, use_container_width=True)
+    with col_b_csv:
+        with st.expander("Bulk Import Books from CSV"):
+            sample_csv_rows = [
+                {
+                    "title": "Things Fall Apart",
+                    "author": "Chinua Achebe",
+                    "isbn": "9780385474542",
+                    "publisher": "Anchor Books",
+                    "stock": 5,
+                    "selling_price": 1200,
+                },
+                {
+                    "title": "The Psychology of Money",
+                    "author": "Morgan Housel",
+                    "isbn": "9780857197689",
+                    "publisher": "Harriman House",
+                    "stock": 4,
+                    "selling_price": 1850,
+                },
+            ]
+            st.download_button(
+                "Download Sample CSV Template",
+                data=to_csv_bytes(sample_csv_rows),
+                file_name="bookstore_import_template.csv",
+                mime="text/csv",
+            )
+            uploaded_csv = st.file_uploader("Upload Books CSV", type=["csv"])
+            if uploaded_csv is not None:
+                if st.button("Import Uploaded CSV", type="primary"):
+                    try:
+                        decoded_text = uploaded_csv.getvalue().decode("utf-8-sig")
+                        reader = csv.DictReader(io.StringIO(decoded_text))
+                        book_cols_info = get_editable_columns("books", "book_id")
+                        allowed_book_cols = {c[0] for c in book_cols_info}
+                        title_col = (
+                            "title"
+                            if "title" in allowed_book_cols
+                            else next(
+                                (c[0] for c in book_cols_info if c[1] in ("text", "character varying")),
+                                None,
+                            )
+                        )
+                        imported_count = 0
+                        with psycopg.connect(DB_URL) as conn:
+                            with conn.cursor() as cur:
+                                for raw_row in reader:
+                                    norm = {
+                                        str(k).strip().lower(): (str(v).strip() if v is not None else "")
+                                        for k, v in raw_row.items()
+                                        if k
+                                    }
+                                    book_title = norm.get("title") or norm.get("book_title")
+                                    if not book_title or not title_col:
+                                        continue
+                                    row_payload = {title_col: book_title}
+                                    for field in ("author", "isbn", "publisher"):
+                                        if field in allowed_book_cols and norm.get(field):
+                                            row_payload[field] = norm[field]
+                                    if "stock" in allowed_book_cols:
+                                        try:
+                                            row_payload["stock"] = max(0, int(float(norm.get("stock") or 1)))
+                                        except ValueError:
+                                            row_payload["stock"] = 1
+                                    if "selling_price" in allowed_book_cols:
+                                        try:
+                                            row_payload["selling_price"] = max(0.0, float(norm.get("selling_price") or 0))
+                                        except ValueError:
+                                            row_payload["selling_price"] = 0.0
+                                    if "cover_url" in allowed_book_cols and row_payload.get("isbn"):
+                                        row_payload["cover_url"] = isbn_to_cover_url(row_payload["isbn"])
+
+                                    cols = list(row_payload.keys())
+                                    ins_q = sql.SQL("INSERT INTO {} ({}) VALUES ({});").format(
+                                        sql.Identifier("books"),
+                                        sql.SQL(", ").join(map(sql.Identifier, cols)),
+                                        sql.SQL(", ").join(sql.Placeholder() * len(cols)),
+                                    )
+                                    cur.execute(ins_q, [row_payload[c] for c in cols])
+                                    imported_count += 1
+                        st.success(f"Imported {imported_count} book(s)!")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"CSV import failed: {e}")
+
+    books_display = []
+    for b_row in books_data:
+        item = dict(b_row)
+        if not item.get("cover_url") and item.get("isbn"):
+            item["cover_url"] = isbn_to_cover_url(item["isbn"])
+        books_display.append(item)
+
+    st.dataframe(
+        books_display,
+        hide_index=True,
+        use_container_width=True,
+        column_config={
+            "cover_url": st.column_config.ImageColumn("Cover", width="small"),
+        },
+    )
     st.download_button(
         "Download Inventory CSV",
         data=to_csv_bytes(books_data),
