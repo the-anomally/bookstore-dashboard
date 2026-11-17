@@ -1275,7 +1275,7 @@ with tab_rentals:
                
                 "status": format_rental_status(reprint_rental[4], reprint_rental[5]),
                 "currency": currency,
-                "late_fee": calculate_late_fee(reprint_rental[4], reprint_rental[5], daily_late_fee),)
+                "late_fee": calculate_late_fee(reprint_rental[4], reprint_rental[5], daily_late_fee),
             }
             st.download_button(
                 "Download Selected Rental Receipt (PDF)",
