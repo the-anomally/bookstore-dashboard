@@ -45,7 +45,17 @@ def isbn_to_cover_url(raw_isbn):
     return f"https://covers.openlibrary.org/b/isbn/{cleaned}-M.jpg" if cleaned else None
 
 
-# --- PASSWORD HASHING HELPERS (INDIVIDUAL CUSTOMER ACCOUNTS) ---
+def log_cashier_action(cur, cashier_name, action_type, details):
+    cur.execute(
+        """
+        INSERT INTO cashier_activity_logs (cashier_name, action_type, details)
+        VALUES (%s, %s, %s);
+        """,
+        (cashier_name, action_type, details),
+    )
+
+
+# --- PASSWORD HASHING HELPERS (STAFF CASHIERS & CUSTOMERS) ---
 def hash_password(plain_password):
     salt = os.urandom(16)
     dk = hashlib.pbkdf2_hmac("sha256", plain_password.encode("utf-8"), salt, 100_000)
@@ -98,6 +108,7 @@ def build_receipt_pdf(receipt_data):
         return s.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
 
     curr = receipt_data["currency"]
+    served_by = receipt_data.get("served_by") or "Staff"
     cust_id_display = (
         f"ID #{receipt_data['customer_id']}"
         if receipt_data.get("customer_id")
@@ -109,37 +120,39 @@ def build_receipt_pdf(receipt_data):
             ("F2", 16, 50, 775, "BOOKSTORE CLOUD PORTAL"),
             ("F1", 11, 50, 755, "OFFICIAL RETAIL SALES RECEIPT"),
             ("F1", 10, 50, 730, f"Receipt No: #{receipt_data['receipt_no']}    Issued Date: {receipt_data['issued_date']}"),
-            ("F1", 10, 50, 714, "-" * 74),
-            ("F2", 11, 50, 692, "CUSTOMER DETAILS"),
-            ("F1", 10, 50, 676, f"Customer: {receipt_data['customer_name']} ({cust_id_display})"),
-            ("F2", 11, 50, 650, "PURCHASE SUMMARY"),
-            ("F1", 10, 50, 634, f"Sale ID: #{receipt_data['record_id']}"),
-            ("F1", 10, 50, 618, f"Book Title: {receipt_data['book_title']} (Book ID #{receipt_data['book_id']})"),
-            ("F1", 10, 50, 602, f"Quantity: {receipt_data['quantity']}    Unit Price: {curr} {receipt_data['unit_price']:,.2f}"),
-            ("F1", 10, 50, 586, f"Payment Method: {receipt_data['payment_method']}"),
-            ("F1", 10, 50, 570, f"Payment Reference: {receipt_data.get('payment_ref') or 'N/A'}"),
-            ("F1", 10, 50, 550, "-" * 74),
-            ("F2", 12, 50, 530, f"Total Amount Paid: {curr} {receipt_data['total_amount']:,.2f}"),
-            ("F1", 9, 50, 495, "Thank you for your purchase! Please retain this receipt for your records."),
+            ("F1", 10, 50, 714, f"Served By: {served_by}"),
+            ("F1", 10, 50, 698, "-" * 74),
+            ("F2", 11, 50, 676, "CUSTOMER DETAILS"),
+            ("F1", 10, 50, 660, f"Customer: {receipt_data['customer_name']} ({cust_id_display})"),
+            ("F2", 11, 50, 634, "PURCHASE SUMMARY"),
+            ("F1", 10, 50, 618, f"Sale ID: #{receipt_data['record_id']}"),
+            ("F1", 10, 50, 602, f"Book Title: {receipt_data['book_title']} (Book ID #{receipt_data['book_id']})"),
+            ("F1", 10, 50, 586, f"Quantity: {receipt_data['quantity']}    Unit Price: {curr} {receipt_data['unit_price']:,.2f}"),
+            ("F1", 10, 50, 570, f"Payment Method: {receipt_data['payment_method']}"),
+            ("F1", 10, 50, 554, f"Payment Reference: {receipt_data.get('payment_ref') or 'N/A'}"),
+            ("F1", 10, 50, 534, "-" * 74),
+            ("F2", 12, 50, 514, f"Total Amount Paid: {curr} {receipt_data['total_amount']:,.2f}"),
+            ("F1", 9, 50, 480, "Thank you for your purchase! Please retain this receipt for your records."),
         ]
     else:
         lines = [
             ("F2", 16, 50, 775, "BOOKSTORE CLOUD PORTAL"),
             ("F1", 11, 50, 755, f"OFFICIAL {receipt_data['type'].upper()} RECEIPT"),
             ("F1", 10, 50, 730, f"Receipt No: #{receipt_data['receipt_no']}    Issued Date: {receipt_data['issued_date']}"),
-            ("F1", 10, 50, 714, "-" * 74),
-            ("F2", 11, 50, 692, "CUSTOMER DETAILS"),
-            ("F1", 10, 50, 676, f"Customer: {receipt_data['customer_name']} ({cust_id_display})"),
-            ("F2", 11, 50, 650, "BOOK & RENTAL SUMMARY"),
-            ("F1", 10, 50, 634, f"Rental ID: #{receipt_data['record_id']}"),
-            ("F1", 10, 50, 618, f"Book Title: {receipt_data['book_title']} (Book ID #{receipt_data['book_id']})"),
-            ("F1", 10, 50, 602, f"Borrow Date: {receipt_data['borrow_date']}"),
-            ("F1", 10, 50, 586, f"Due Date: {receipt_data['due_date']}"),
-            ("F1", 10, 50, 570, f"Return Date: {receipt_data['return_date']}"),
-            ("F1", 10, 50, 554, f"Status: {receipt_data['status']}"),
-            ("F1", 10, 50, 534, "-" * 74),
-            ("F2", 12, 50, 514, f"Late Fee Balance / Paid: {curr} {receipt_data['late_fee']:,.2f}"),
-            ("F1", 9, 50, 480, "Thank you for reading with us. Please retain this receipt for your records."),
+            ("F1", 10, 50, 714, f"Served By: {served_by}"),
+            ("F1", 10, 50, 698, "-" * 74),
+            ("F2", 11, 50, 676, "CUSTOMER DETAILS"),
+            ("F1", 10, 50, 660, f"Customer: {receipt_data['customer_name']} ({cust_id_display})"),
+            ("F2", 11, 50, 634, "BOOK & RENTAL SUMMARY"),
+            ("F1", 10, 50, 618, f"Rental ID: #{receipt_data['record_id']}"),
+            ("F1", 10, 50, 602, f"Book Title: {receipt_data['book_title']} (Book ID #{receipt_data['book_id']})"),
+            ("F1", 10, 50, 586, f"Borrow Date: {receipt_data['borrow_date']}"),
+            ("F1", 10, 50, 570, f"Due Date: {receipt_data['due_date']}"),
+            ("F1", 10, 50, 554, f"Return Date: {receipt_data['return_date']}"),
+            ("F1", 10, 50, 538, f"Status: {receipt_data['status']}"),
+            ("F1", 10, 50, 518, "-" * 74),
+            ("F2", 12, 50, 498, f"Late Fee Balance / Paid: {curr} {receipt_data['late_fee']:,.2f}"),
+            ("F1", 9, 50, 464, "Thank you for reading with us. Please retain this receipt for your records."),
         ]
 
     stream_cmds = [
@@ -242,11 +255,13 @@ def send_sms_reminder(phone_number, message_text):
         return False, f"SMS failed: {e}"
 
 
-# Ensure schema extensions, retail sales, reviews, reservations, and settings exist
+# Ensure schema extensions, cashier accounts, activity logs, sales, reviews, and settings exist
 with psycopg.connect(DB_URL) as conn:
     with conn.cursor() as cur:
         cur.execute("ALTER TABLE rentals ADD COLUMN IF NOT EXISTS return_date DATE;")
         cur.execute("ALTER TABLE rentals ADD COLUMN IF NOT EXISTS due_date DATE;")
+        cur.execute("ALTER TABLE rentals ADD COLUMN IF NOT EXISTS checked_out_by TEXT;")
+        cur.execute("ALTER TABLE rentals ADD COLUMN IF NOT EXISTS returned_by TEXT;")
         cur.execute("ALTER TABLE books ADD COLUMN IF NOT EXISTS stock INTEGER NOT NULL DEFAULT 1;")
         cur.execute("ALTER TABLE books ADD COLUMN IF NOT EXISTS selling_price NUMERIC(10, 2) NOT NULL DEFAULT 0.00;")
         cur.execute("ALTER TABLE books ADD COLUMN IF NOT EXISTS isbn TEXT;")
@@ -258,6 +273,29 @@ with psycopg.connect(DB_URL) as conn:
         cur.execute("ALTER TABLE customers ADD COLUMN IF NOT EXISTS password_hash TEXT;")
         cur.execute(
             """
+            CREATE TABLE IF NOT EXISTS staff_users (
+                staff_id SERIAL PRIMARY KEY,
+                full_name TEXT NOT NULL,
+                username TEXT UNIQUE NOT NULL,
+                role TEXT NOT NULL DEFAULT 'Cashier',
+                password_hash TEXT NOT NULL,
+                active BOOLEAN NOT NULL DEFAULT TRUE
+            );
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS cashier_activity_logs (
+                activity_id SERIAL PRIMARY KEY,
+                cashier_name TEXT NOT NULL,
+                action_type TEXT NOT NULL,
+                details TEXT,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        )
+        cur.execute(
+            """
             CREATE TABLE IF NOT EXISTS sales (
                 sale_id SERIAL PRIMARY KEY,
                 book_id INTEGER NOT NULL REFERENCES books(book_id),
@@ -267,10 +305,12 @@ with psycopg.connect(DB_URL) as conn:
                 total_amount NUMERIC(10, 2) NOT NULL,
                 payment_method TEXT NOT NULL DEFAULT 'Cash',
                 payment_ref TEXT,
-                sale_date DATE NOT NULL DEFAULT CURRENT_DATE
+                sale_date DATE NOT NULL DEFAULT CURRENT_DATE,
+                sold_by TEXT
             );
             """
         )
+        cur.execute("ALTER TABLE sales ADD COLUMN IF NOT EXISTS sold_by TEXT;")
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS reservations (
@@ -278,10 +318,12 @@ with psycopg.connect(DB_URL) as conn:
                 book_id INTEGER NOT NULL REFERENCES books(book_id),
                 customer_id INTEGER NOT NULL REFERENCES customers(customer_id),
                 reserved_date DATE NOT NULL DEFAULT CURRENT_DATE,
-                status TEXT NOT NULL DEFAULT 'Pending'
+                status TEXT NOT NULL DEFAULT 'Pending',
+                processed_by TEXT
             );
             """
         )
+        cur.execute("ALTER TABLE reservations ADD COLUMN IF NOT EXISTS processed_by TEXT;")
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS reviews (
@@ -300,14 +342,16 @@ with psycopg.connect(DB_URL) as conn:
             CREATE TABLE IF NOT EXISTS bookstore_settings (
                 id INTEGER PRIMARY KEY DEFAULT 1,
                 daily_late_fee NUMERIC(10, 2) NOT NULL DEFAULT 50.00,
-                currency TEXT NOT NULL DEFAULT 'KES'
+                currency TEXT NOT NULL DEFAULT 'KES',
+                low_stock_threshold INTEGER NOT NULL DEFAULT 2
             );
             """
         )
+        cur.execute("ALTER TABLE bookstore_settings ADD COLUMN IF NOT EXISTS low_stock_threshold INTEGER NOT NULL DEFAULT 2;")
         cur.execute(
             """
-            INSERT INTO bookstore_settings (id, daily_late_fee, currency)
-            VALUES (1, 50.00, 'KES')
+            INSERT INTO bookstore_settings (id, daily_late_fee, currency, low_stock_threshold)
+            VALUES (1, 50.00, 'KES', 2)
             ON CONFLICT (id) DO NOTHING;
             """
         )
@@ -361,7 +405,7 @@ def render_field_input(col_name, data_type, current_val=None, widget_key=None):
         return text_val.strip() if text_val.strip() else None
 
 
-def render_add_row_form(table_name, id_col, form_key, button_label, prefill=None):
+def render_add_row_form(table_name, id_col, form_key, button_label, prefill=None, actor_name=None):
     col_rows = get_editable_columns(table_name, id_col)
     prefill = prefill or {}
     with st.form(form_key, clear_on_submit=True):
@@ -376,7 +420,7 @@ def render_add_row_form(table_name, id_col, form_key, button_label, prefill=None
                 col_name,
                 data_type,
                 current_val=default_override,
-                widget_key=f"{form_key}{col_name}{prefill.get('isbn', 'blank')}",
+                widget_key=f"{form_key}_{col_name}_{prefill.get('isbn', 'blank')}",
             )
         if st.form_submit_button(button_label):
             try:
@@ -391,6 +435,14 @@ def render_add_row_form(table_name, id_col, form_key, button_label, prefill=None
                 with psycopg.connect(DB_URL) as conn:
                     with conn.cursor() as cur:
                         cur.execute(query, [values[c] for c in cols])
+                        if actor_name:
+                            first_val = next((v for v in values.values() if v), "New record")
+                            log_cashier_action(
+                                cur,
+                                actor_name,
+                                f"Add {table_name[:-1].title()}",
+                                f"Added '{first_val}'",
+                            )
                 if table_name == "books" and "isbn_prefill" in st.session_state:
                     st.session_state["isbn_prefill"] = {}
                 st.success(f"{button_label} successful!")
@@ -399,9 +451,11 @@ def render_add_row_form(table_name, id_col, form_key, button_label, prefill=None
                 st.error(f"Could not save record: {e}")
 
 
-# --- DUAL-ROLE LOGIN GATE (STAFF vs INDIVIDUAL CUSTOMER ACCOUNTS) ---
+# --- DUAL-ROLE LOGIN GATE (NAMED STAFF CASHIERS vs INDIVIDUAL CUSTOMERS) ---
 if "role" not in st.session_state:
     st.session_state["role"] = None
+if "staff_user" not in st.session_state:
+    st.session_state["staff_user"] = None
 if "customer_user" not in st.session_state:
     st.session_state["customer_user"] = None
 
@@ -411,17 +465,46 @@ def require_login():
         return True
 
     st.title("Bookstore Cloud Portal")
-    tab_staff_login, tab_cust_login = st.tabs(["Staff Login", "Customer Login"])
-
+    tab_staff_login, tab_cust_login = st.tabs(["Staff & Cashier Login", "Customer Login"])
     with tab_staff_login:
         with st.form("staff_login_form"):
-            entered_password = st.text_input("Staff Password", type="password")
+            cashier_username = st.text_input(
+                "Cashier Username (leave blank for Store Admin master login)",
+                placeholder="e.g. jane.doe",
+            ).strip().lower()
+            entered_password = st.text_input("Password", type="password")
             if st.form_submit_button("Log In as Staff"):
-                if hmac.compare_digest(entered_password, st.secrets["STAFF_PASSWORD"]):
-                    st.session_state["role"] = "staff"
-                    st.rerun()
+                if not cashier_username or cashier_username == "admin":
+                    if hmac.compare_digest(entered_password, st.secrets["STAFF_PASSWORD"]):
+                        st.session_state["role"] = "staff"
+                        st.session_state["staff_user"] = {
+                            "name": "Store Admin",
+                            "username": "admin",
+                            "role": "Admin",
+                        }
+                        st.rerun()
+                    else:
+                        st.error("Incorrect master admin password.")
                 else:
-                    st.error("Incorrect staff password.")
+                    _, staff_dicts = fetch_table(
+                        "SELECT staff_id, full_name, username, role, password_hash, active FROM staff_users WHERE LOWER(username) = %s;",
+                        (cashier_username,),
+                    )
+                    staff_match = staff_dicts[0] if staff_dicts else None
+                    if not staff_match:
+                        st.error("Cashier username not found.")
+                    elif not staff_match["active"]:
+                        st.error("This cashier account is currently suspended. Contact Store Admin.")
+                    elif verify_password(entered_password, staff_match["password_hash"]):
+                        st.session_state["role"] = "staff"
+                        st.session_state["staff_user"] = {
+                            "name": staff_match["full_name"],
+                            "username": staff_match["username"],
+                            "role": staff_match["role"],
+                        }
+                        st.rerun()
+                    else:
+                        st.error("Incorrect cashier password.")
 
     with tab_cust_login:
         with st.form("customer_login_form"):
@@ -547,29 +630,32 @@ def format_rental_status(return_date, due_date):
 
 
 # Load shared data and store settings
-settings_rows, _ = fetch_table("SELECT daily_late_fee, currency FROM bookstore_settings WHERE id = 1;")
+settings_rows, _ = fetch_table(
+    "SELECT daily_late_fee, currency, low_stock_threshold FROM bookstore_settings WHERE id = 1;"
+)
 daily_late_fee = float(settings_rows[0][0]) if settings_rows else 50.00
 currency = settings_rows[0][1] if settings_rows else "KES"
+low_stock_threshold = int(settings_rows[0][2]) if settings_rows and settings_rows[0][2] is not None else 2
 
 book_rows, books_data = fetch_table("SELECT * FROM books ORDER BY book_id;")
 customer_rows, customers_data = fetch_table("SELECT * FROM customers ORDER BY customer_id;")
 all_rentals, _ = fetch_table(
     """
-    SELECT rental_id, book_id, customer_id, borrow_date, return_date, due_date
+    SELECT rental_id, book_id, customer_id, borrow_date, return_date, due_date, checked_out_by, returned_by
     FROM rentals
     ORDER BY rental_id DESC;
     """
 )
 all_sales, _ = fetch_table(
     """
-    SELECT sale_id, book_id, customer_id, quantity, unit_price, total_amount, payment_method, payment_ref, sale_date
+    SELECT sale_id, book_id, customer_id, quantity, unit_price, total_amount, payment_method, payment_ref, sale_date, sold_by
     FROM sales
     ORDER BY sale_id DESC;
     """
 )
 all_reservations, _ = fetch_table(
     """
-    SELECT reservation_id, book_id, customer_id, reserved_date, status
+    SELECT reservation_id, book_id, customer_id, reserved_date, status, processed_by
     FROM reservations
     ORDER BY reservation_id DESC;
     """
@@ -733,11 +819,11 @@ if st.session_state["role"] == "customer":
                                 else:
                                     st.caption("No Cover")
                             with c_info:
-                                st.markdown(f"*{book_card['title']}*")
+                                st.markdown(f"**{book_card['title']}**")
                                 st.caption(book_card["author"])
-                                st.write(f"Rating: *{book_card['rating']}*")
-                                st.write(f"Buy: *{book_card['price_label']}*")
-                                st.write(f"Status: *{book_card['availability']}*")
+                                st.write(f"Rating: **{book_card['rating']}**")
+                                st.write(f"Buy: **{book_card['price_label']}**")
+                                st.write(f"Status: **{book_card['availability']}**")
         else:
             st.info("No matching books found.")
 
@@ -818,6 +904,7 @@ if st.session_state["role"] == "customer":
                             )
                     st.success("Thank you! Your review has been published.")
                     st.rerun()
+
         reviews_table = []
         if all_reviews:
             reviews_table = [
@@ -833,7 +920,7 @@ if st.session_state["role"] == "customer":
         if reviews_table:
             st.dataframe(reviews_table, hide_index=True, use_container_width=True)
         else:
-            st.info("No reader reviews yet. Be the first to rate a book above!")         
+            st.info("No reader reviews yet. Be the first to rate a book above!")
 
     with tab_my_purchases:
         if my_sales:
@@ -857,15 +944,27 @@ if st.session_state["role"] == "customer":
     st.stop()
 
 # ==============================================================================
-# VIEW B: STAFF ADMIN DASHBOARD
+# VIEW B: STAFF ADMIN & CASHIER DASHBOARD
 # ==============================================================================
+current_staff = st.session_state.get("staff_user") or {
+    "name": "Store Admin",
+    "username": "admin",
+    "role": "Admin",
+}
+active_cashier_name = current_staff["name"]
+is_staff_admin = current_staff.get("role") == "Admin"
+
 col_title, col_logout = st.columns([6, 1])
 with col_title:
     st.title("Bookstore Staff Dashboard")
+    st.caption(
+        f"Signed in as: **{active_cashier_name}** (`@{current_staff.get('username', 'admin')}` — Role: **{current_staff.get('role', 'Admin')}**)"
+    )
 with col_logout:
     st.write("")
     if st.button("Log Out"):
         st.session_state["role"] = None
+        st.session_state["staff_user"] = None
         st.rerun()
 
 
@@ -914,6 +1013,12 @@ def render_edit_row_form(table_name, id_col, raw_rows, dict_rows, form_key, expa
                     with psycopg.connect(DB_URL) as conn:
                         with conn.cursor() as cur:
                             cur.execute(query, params)
+                            log_cashier_action(
+                                cur,
+                                active_cashier_name,
+                                f"Edit {table_name[:-1].title()}",
+                                f"Updated {table_name} ID #{record_id}",
+                            )
                     st.rerun()
                 except Exception as e:
                     st.error(f"Could not update record: {e}")
@@ -927,6 +1032,9 @@ total_active_late_fees = sum(
 )
 total_sales_revenue = sum(float(s[5]) for s in all_sales)
 available_books = [(raw, d) for raw, d in zip(book_rows, books_data) if d.get("stock", 0) > 0]
+low_stock_books = [
+    d for d in books_data if int(d.get("stock", 0)) <= low_stock_threshold
+]
 
 # --- OVERDUE ALERTS & AUTOMATED EMAIL/SMS REMINDERS ---
 if overdue_rentals:
@@ -981,15 +1089,50 @@ if overdue_rentals:
                 ok, info = send_sms_reminder(contact.get("phone"), reminder_msg)
                 (st.success if ok else st.warning)(info)
 
+# --- LOW-STOCK REORDER ALERTS BANNER ---
+if low_stock_books:
+    low_items = []
+    reorder_rows = []
+    for b in low_stock_books:
+        stk = int(b.get("stock", 0))
+        b_title = b.get("title") or book_names.get(b["book_id"], f"Book #{b['book_id']}")
+        status_tag = "OUT OF STOCK (0 left)" if stk == 0 else f"Low Stock ({stk} left)"
+        low_items.append(f"**{b_title}** (ID #{b['book_id']}) — **{status_tag}**")
+        reorder_rows.append(
+            {
+                "Book ID": b["book_id"],
+                "Title": b_title,
+                "Author": b.get("author") or "",
+                "ISBN": b.get("isbn") or "",
+                "Current Stock": stk,
+                "Suggested Reorder Qty": max(5, (low_stock_threshold * 3) - stk),
+                f"Selling Price ({currency})": float(b.get("selling_price", 0)),
+            }
+        )
+
+    st.warning(
+        f"**Low-Stock Reorder Alert ({len(low_stock_books)} title(s) at or below {low_stock_threshold} copies):**\n\n"
+        + "\n".join(f"- {line}" for line in low_items)
+    )
+    with st.expander("View Low-Stock Reorder List & Export Supplier CSV"):
+        st.dataframe(reorder_rows, hide_index=True, use_container_width=True)
+        st.download_button(
+            "Download Low-Stock Reorder CSV",
+            data=to_csv_bytes(reorder_rows),
+            file_name=f"low_stock_reorder_{today}.csv",
+            mime="text/csv",
+        )
+
 # --- KPI SUMMARY METRICS ---
-m1, m2, m3, m4, m5, m6, m7 = st.columns(7)
+m1, m2, m3, m4, m5, m6, m7, m8 = st.columns(8)
 m1.metric("Book Titles", len(book_rows))
 m2.metric("Copies in Stock", total_copies_in_stock)
-m3.metric("Active Rentals", len(active_rentals))
-m4.metric("Overdue", len(overdue_rentals))
-m5.metric("Pending Pickups", len(pending_reservations))
-m6.metric("Active Late Fees", f"{currency} {total_active_late_fees:,.2f}")
-m7.metric("Retail Revenue", f"{currency} {total_sales_revenue:,.2f}")
+m3.metric("Low / Out Stock", len(low_stock_books))
+m4.metric("Active Rentals", len(active_rentals))
+m5.metric("Overdue", len(overdue_rentals))
+m6.metric("Pending Pickups", len(pending_reservations))
+m7.metric("Active Late Fees", f"{currency} {total_active_late_fees:,.2f}")
+m8.metric("Retail Revenue", f"{currency} {total_sales_revenue:,.2f}")
 
 # --- PRINTABLE PDF RECEIPT BANNER (AFTER SALE, CHECKOUT, OR RETURN) ---
 if st.session_state.get("last_receipt"):
@@ -1001,7 +1144,7 @@ if st.session_state.get("last_receipt"):
     )
     st.success(
         f"**{rec['type']} Recorded** for **{rec['customer_name']}** — "
-        f"*{rec['book_title']}*{summary_suffix}."
+        f"*{rec['book_title']}*{summary_suffix} (Cashier: **{rec.get('served_by', active_cashier_name)}**)."
     )
     col_pdf_dl, col_pdf_dismiss = st.columns([3, 1])
     with col_pdf_dl:
@@ -1051,18 +1194,29 @@ if pending_reservations:
                             st.error("Cannot fulfill reservation: book is out of stock.")
                         else:
                             cur.execute(
-                                "INSERT INTO rentals (book_id, customer_id, borrow_date, due_date) VALUES (%s, %s, %s, %s) RETURNING rental_id;",
-                                (selected_res[1], selected_res[2], today, res_due_date),
+                                """
+                                INSERT INTO rentals (book_id, customer_id, borrow_date, due_date, checked_out_by)
+                                VALUES (%s, %s, %s, %s, %s)
+                                RETURNING rental_id;
+                                """,
+                                (selected_res[1], selected_res[2], today, res_due_date, active_cashier_name),
                             )
                             new_rid = cur.fetchone()[0]
                             cur.execute(
-                                "UPDATE reservations SET status = 'Fulfilled' WHERE reservation_id = %s;",
-                                (selected_res[0],),
+                                "UPDATE reservations SET status = 'Fulfilled', processed_by = %s WHERE reservation_id = %s;",
+                                (active_cashier_name, selected_res[0]),
+                            )
+                            log_cashier_action(
+                                cur,
+                                active_cashier_name,
+                                "Reservation Checkout",
+                                f"Fulfilled Reservation #{selected_res[0]} -> Rental #{new_rid} ({book_names.get(selected_res[1], '')})",
                             )
                             st.session_state["last_receipt"] = {
                                 "receipt_no": f"CHK-{new_rid}",
                                 "type": "Checkout",
                                 "issued_date": str(today),
+                                "served_by": active_cashier_name,
                                 "record_id": new_rid,
                                 "customer_id": selected_res[2],
                                 "customer_name": customer_names.get(selected_res[2], f"Customer #{selected_res[2]}"),
@@ -1080,8 +1234,14 @@ if pending_reservations:
                 with psycopg.connect(DB_URL) as conn:
                     with conn.cursor() as cur:
                         cur.execute(
-                            "UPDATE reservations SET status = 'Cancelled' WHERE reservation_id = %s;",
-                            (selected_res[0],),
+                            "UPDATE reservations SET status = 'Cancelled', processed_by = %s WHERE reservation_id = %s;",
+                            (active_cashier_name, selected_res[0]),
+                        )
+                        log_cashier_action(
+                            cur,
+                            active_cashier_name,
+                            "Cancel Reservation",
+                            f"Cancelled Reservation #{selected_res[0]}",
                         )
                 st.rerun()
 
@@ -1121,14 +1281,25 @@ with col_checkout:
                             st.error("This book just went out of stock.")
                         else:
                             cur.execute(
-                                "INSERT INTO rentals (book_id, customer_id, borrow_date, due_date) VALUES (%s, %s, %s, %s) RETURNING rental_id;",
-                                (book_id, selected_customer[0], today, due_date),
+                                """
+                                INSERT INTO rentals (book_id, customer_id, borrow_date, due_date, checked_out_by)
+                                VALUES (%s, %s, %s, %s, %s)
+                                RETURNING rental_id;
+                                """,
+                                (book_id, selected_customer[0], today, due_date, active_cashier_name),
                             )
                             new_rid = cur.fetchone()[0]
+                            log_cashier_action(
+                                cur,
+                                active_cashier_name,
+                                "Book Checkout",
+                                f"Rental #{new_rid}: '{selected_book[0][1]}' to {selected_customer[1]}",
+                            )
                             st.session_state["last_receipt"] = {
                                 "receipt_no": f"CHK-{new_rid}",
                                 "type": "Checkout",
                                 "issued_date": str(today),
+                                "served_by": active_cashier_name,
                                 "record_id": new_rid,
                                 "customer_id": selected_customer[0],
                                 "customer_name": selected_customer[1],
@@ -1165,8 +1336,13 @@ with col_return:
                 with psycopg.connect(DB_URL) as conn:
                     with conn.cursor() as cur:
                         cur.execute(
-                            "UPDATE rentals SET return_date = %s WHERE rental_id = %s AND return_date IS NULL RETURNING book_id;",
-                            (today, selected_rental[0]),
+                            """
+                            UPDATE rentals
+                            SET return_date = %s, returned_by = %s
+                            WHERE rental_id = %s AND return_date IS NULL
+                            RETURNING book_id;
+                            """,
+                            (today, active_cashier_name, selected_rental[0]),
                         )
                         returned_row = cur.fetchone()
                         if returned_row:
@@ -1174,10 +1350,17 @@ with col_return:
                                 "UPDATE books SET stock = stock + 1 WHERE book_id = %s;",
                                 (returned_row[0],),
                             )
+                            log_cashier_action(
+                                cur,
+                                active_cashier_name,
+                                "Book Return",
+                                f"Rental #{selected_rental[0]} returned (Late Fee: {currency} {settled_fee:,.2f})",
+                            )
                             st.session_state["last_receipt"] = {
                                 "receipt_no": f"RET-{selected_rental[0]}",
                                 "type": "Return",
                                 "issued_date": str(today),
+                                "served_by": active_cashier_name,
                                 "record_id": selected_rental[0],
                                 "customer_id": selected_rental[2],
                                 "customer_name": customer_names.get(selected_rental[2], f"Customer #{selected_rental[2]}"),
@@ -1248,9 +1431,9 @@ with col_pos:
                                 """
                                 INSERT INTO sales (
                                     book_id, customer_id, quantity, unit_price, total_amount,
-                                    payment_method, payment_ref, sale_date
+                                    payment_method, payment_ref, sale_date, sold_by
                                 )
-                                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                                 RETURNING sale_id;
                                 """,
                                 (
@@ -1262,13 +1445,21 @@ with col_pos:
                                     pay_method,
                                     pay_ref or None,
                                     today,
+                                    active_cashier_name,
                                 ),
                             )
                             new_sale_id = cur.fetchone()[0]
+                            log_cashier_action(
+                                cur,
+                                active_cashier_name,
+                                "Retail Sale",
+                                f"Sale #{new_sale_id}: '{sale_book[0][1]}' x{int(sale_qty)} = {currency} {total_paid:,.2f} ({pay_method})",
+                            )
                             st.session_state["last_receipt"] = {
                                 "receipt_no": f"SAL-{new_sale_id}",
                                 "type": "Sale",
                                 "issued_date": str(today),
+                                "served_by": active_cashier_name,
                                 "record_id": new_sale_id,
                                 "customer_id": buyer_id,
                                 "customer_name": buyer_name,
@@ -1285,67 +1476,96 @@ with col_pos:
     else:
         st.warning("No books in stock to sell.")
 
-# --- STORE SETTINGS & PRE-LAUNCH TEST DATA RESET ---
-with st.expander(f"Store Settings & Pre-Launch Reset (Late Fee: {currency} {daily_late_fee:,.2f} / day)"):
-    col_set1, col_set2 = st.columns(2)
-    with col_set1:
-        with st.form("late_fee_settings_form"):
-            st.markdown("**Currency & Late Fee Rate**")
-            new_currency = st.text_input("Currency Code / Symbol", value=currency).strip() or "KES"
-            new_rate = st.number_input(
-                "Daily Overdue Rate", min_value=0.0, step=5.0, value=daily_late_fee
-            )
-            if st.form_submit_button("Update Store Settings"):
-                with psycopg.connect(DB_URL) as conn:
-                    with conn.cursor() as cur:
-                        cur.execute(
-                            "UPDATE bookstore_settings SET currency = %s, daily_late_fee = %s WHERE id = 1;",
-                            (new_currency, new_rate),
-                        )
-                st.rerun()
-
-    with col_set2:
-        with st.form("reset_demo_data_form", clear_on_submit=True):
-            st.markdown("**Pre-Launch Test Data Reset**")
-            st.caption(
-                "Clears test rentals, sales, reservations, reviews, and audit logs "
-                "while keeping your books and customer accounts."
-            )
-            confirm_reset_box = st.checkbox("Confirm clearing all test transaction history")
-            reset_staff_pw = st.text_input("Re-enter Staff Password to Confirm", type="password")
-            if st.form_submit_button("Clear Test Transactions", type="primary"):
-                if not confirm_reset_box:
-                    st.warning("Please tick the confirmation box first.")
-                elif not hmac.compare_digest(reset_staff_pw, st.secrets["STAFF_PASSWORD"]):
-                    st.error("Incorrect staff password.")
-                else:
+# --- STORE SETTINGS & PRE-LAUNCH TEST DATA RESET (ADMIN ONLY) ---
+if is_staff_admin:
+    with st.expander(
+        f"Store Settings & Pre-Launch Reset (Late Fee: {currency} {daily_late_fee:,.2f}/day | Low-Stock Alert: <= {low_stock_threshold})"
+    ):
+        col_set1, col_set2 = st.columns(2)
+        with col_set1:
+            with st.form("late_fee_settings_form"):
+                st.markdown("**Currency, Late Fee & Stock Alert Threshold**")
+                new_currency = st.text_input("Currency Code / Symbol", value=currency).strip() or "KES"
+                new_rate = st.number_input(
+                    "Daily Overdue Rate", min_value=0.0, step=5.0, value=daily_late_fee
+                )
+                new_low_stock = st.number_input(
+                    "Low-Stock Reorder Alert Threshold (copies)",
+                    min_value=0,
+                    step=1,
+                    value=low_stock_threshold,
+                )
+                if st.form_submit_button("Update Store Settings"):
                     with psycopg.connect(DB_URL) as conn:
                         with conn.cursor() as cur:
-                            cur.execute("DELETE FROM rental_logs;")
-                            cur.execute("DELETE FROM rentals;")
-                            cur.execute("DELETE FROM sales;")
-                            cur.execute("DELETE FROM reservations;")
-                            cur.execute("DELETE FROM reviews;")
-                    st.session_state["last_receipt"] = None
-                    st.success("All test transactions cleared!")
+                            cur.execute(
+                                """
+                                UPDATE bookstore_settings
+                                SET currency = %s, daily_late_fee = %s, low_stock_threshold = %s
+                                WHERE id = 1;
+                                """,
+                                (new_currency, new_rate, int(new_low_stock)),
+                            )
+                            log_cashier_action(
+                                cur,
+                                active_cashier_name,
+                                "Update Settings",
+                                f"Currency={new_currency}, Rate={new_rate}, LowStock<={int(new_low_stock)}",
+                            )
                     st.rerun()
 
-# --- SECTION 2: Database Explorer, Sales Ledger, Analytics & CSV Exports ---
+        with col_set2:
+            with st.form("reset_demo_data_form", clear_on_submit=True):
+                st.markdown("**Pre-Launch Test Data Reset**")
+                st.caption(
+                    "Clears test rentals, sales, reservations, reviews, and audit logs "
+                    "while keeping your books, staff cashiers, and customer accounts."
+                )
+                confirm_reset_box = st.checkbox("Confirm clearing all test transaction history")
+                reset_staff_pw = st.text_input("Re-enter Master Staff Password to Confirm", type="password")
+                if st.form_submit_button("Clear Test Transactions", type="primary"):
+                    if not confirm_reset_box:
+                        st.warning("Please tick the confirmation box first.")
+                    elif not hmac.compare_digest(reset_staff_pw, st.secrets["STAFF_PASSWORD"]):
+                        st.error("Incorrect master staff password.")
+                    else:
+                        with psycopg.connect(DB_URL) as conn:
+                            with conn.cursor() as cur:
+                                cur.execute("DELETE FROM rental_logs;")
+                                cur.execute("DELETE FROM rentals;")
+                                cur.execute("DELETE FROM sales;")
+                                cur.execute("DELETE FROM reservations;")
+                                cur.execute("DELETE FROM reviews;")
+                                cur.execute("DELETE FROM cashier_activity_logs;")
+                        st.session_state["last_receipt"] = None
+                        st.success("All test transactions cleared!")
+                        st.rerun()
+
+# --- SECTION 2: Database Explorer, Sales Ledger, Analytics, Staff & Logs ---
 st.subheader("Database Explorer & Reports")
-tab_rentals, tab_sales, tab_analytics, tab_books, tab_customers, tab_logs = st.tabs(
+tab_rentals, tab_sales, tab_analytics, tab_books, tab_customers, tab_staff, tab_logs = st.tabs(
     [
         "Live Rentals (View)",
         "Sales & Payments",
         "Analytics",
         "Books",
         "Customers",
-        "Audit Logs (Trigger)",
+        "Staff & Cashiers",
+        "Audit Logs",
     ]
 )
 
 with tab_rentals:
     _, rentals_data = fetch_table("SELECT * FROM rental_details ORDER BY rental_id DESC;")
-    rental_meta = {r[0]: {"due_date": r[5], "return_date": r[4]} for r in all_rentals}
+    rental_meta = {
+        r[0]: {
+            "due_date": r[5],
+            "return_date": r[4],
+            "checked_out_by": r[6],
+            "returned_by": r[7],
+        }
+        for r in all_rentals
+    }
     enriched_rentals = []
     for row in rentals_data:
         item = dict(row)
@@ -1355,12 +1575,14 @@ with tab_rentals:
         item["due_date"] = due_d
         item["status"] = format_rental_status(ret_d, due_d)
         item[f"late_fee_{currency}"] = calculate_late_fee(ret_d, due_d, daily_late_fee)
+        item["checked_out_by"] = meta.get("checked_out_by") or "Staff"
+        item["returned_by"] = meta.get("returned_by") or ("—" if ret_d is None else "Staff")
         enriched_rentals.append(item)
 
     search_term = (
         st.text_input(
             "Search Rentals",
-            placeholder="Filter by book title, customer name, status, or ID...",
+            placeholder="Filter by book title, customer name, cashier, status, or ID...",
         )
         .strip()
         .lower()
@@ -1411,6 +1633,11 @@ with tab_rentals:
                 "receipt_no": f"RPT-{reprint_rental[0]}",
                 "type": "Return" if reprint_rental[4] else "Checkout",
                 "issued_date": str(today),
+                "served_by": (
+                    reprint_rental[7]
+                    if reprint_rental[4] and reprint_rental[7]
+                    else (reprint_rental[6] or active_cashier_name)
+                ),
                 "record_id": reprint_rental[0],
                 "customer_id": reprint_rental[2],
                 "customer_name": customer_names.get(reprint_rental[2], f"Customer #{reprint_rental[2]}"),
@@ -1465,6 +1692,12 @@ with tab_rentals:
                                             "UPDATE books SET stock = stock + 1 WHERE book_id = %s;",
                                             (rental_to_delete[1],),
                                         )
+                                    log_cashier_action(
+                                        cur,
+                                        active_cashier_name,
+                                        "Delete Rental",
+                                        f"Deleted Rental #{rental_to_delete[0]}",
+                                    )
                             st.rerun()
                         except psycopg.errors.ForeignKeyViolation:
                             st.error("This rental is referenced in rental_logs. Tick the second box above to remove its linked log entry as well.")
@@ -1494,6 +1727,7 @@ with tab_sales:
             f"total_{currency}": float(s[5]),
             "payment_method": s[6],
             "payment_ref": s[7] or "",
+            "sold_by": s[9] or "Staff",
         }
         for s in all_sales
     ]
@@ -1501,7 +1735,7 @@ with tab_sales:
     sales_search = (
         st.text_input(
             "Search Sales Ledger",
-            placeholder="Filter by book title, customer, M-Pesa ref, payment method, or date...",
+            placeholder="Filter by book title, customer, cashier, M-Pesa ref, payment method...",
         )
         .strip()
         .lower()
@@ -1537,6 +1771,7 @@ with tab_sales:
                     "receipt_no": f"SAL-{reprint_sale[0]}",
                     "type": "Sale",
                     "issued_date": str(today),
+                    "served_by": reprint_sale[9] or active_cashier_name,
                     "record_id": reprint_sale[0],
                     "customer_id": reprint_sale[2],
                     "customer_name": (
@@ -1590,6 +1825,12 @@ with tab_sales:
                                             "UPDATE books SET stock = stock + %s WHERE book_id = %s;",
                                             (int(sale_to_delete[3]), sale_to_delete[1]),
                                         )
+                                    log_cashier_action(
+                                        cur,
+                                        active_cashier_name,
+                                        "Void Sale",
+                                        f"Voided Sale #{sale_to_delete[0]} ({currency} {float(sale_to_delete[5]):,.2f})",
+                                    )
                             st.rerun()
 
 with tab_analytics:
@@ -1645,19 +1886,19 @@ with tab_analytics:
                 st.info("No retail sales data yet.")
 
         with chart_col4:
-            st.markdown("**Top Customers by Rentals**")
-            if all_rentals:
-                cust_counts = {}
-                for r in all_rentals:
-                    cname = customer_names.get(r[2], f"Customer #{r[2]}")
-                    cust_counts[cname] = cust_counts.get(cname, 0) + 1
-                top_cust_chart = [
-                    {"Customer": cname, "Total Rentals": count}
-                    for cname, count in sorted(cust_counts.items(), key=lambda x: x[1], reverse=True)[:10]
+            st.markdown(f"**Retail Sales by Cashier ({currency})**")
+            if all_sales:
+                cashier_rev = {}
+                for s in all_sales:
+                    c_name = s[9] or "Staff"
+                    cashier_rev[c_name] = cashier_rev.get(c_name, 0.0) + float(s[5])
+                cashier_chart = [
+                    {"Cashier": cname, f"Revenue ({currency})": rev}
+                    for cname, rev in sorted(cashier_rev.items(), key=lambda x: x[1], reverse=True)
                 ]
-                st.bar_chart(top_cust_chart, x="Customer", y="Total Rentals")
+                st.bar_chart(cashier_chart, x="Cashier", y=f"Revenue ({currency})")
             else:
-                st.info("No rental data yet.")
+                st.info("No retail sales data yet.")
 
         if all_rentals:
             st.markdown("**Checkout Activity Over Time**")
@@ -1704,6 +1945,7 @@ with tab_books:
                 "add_book_form",
                 "Save New Book",
                 prefill=st.session_state["isbn_prefill"],
+                actor_name=active_cashier_name,
             )
 
     with col_b_edit:
@@ -1795,6 +2037,12 @@ with tab_books:
                                     )
                                     cur.execute(ins_q, [row_payload[c] for c in cols])
                                     imported_count += 1
+                                log_cashier_action(
+                                    cur,
+                                    active_cashier_name,
+                                    "Bulk CSV Import",
+                                    f"Imported {imported_count} book(s) from CSV",
+                                )
                         st.success(f"Imported {imported_count} book(s)!")
                         st.rerun()
                     except Exception as e:
@@ -1843,6 +2091,12 @@ with tab_books:
                                         "DELETE FROM books WHERE book_id = %s;",
                                         (book_to_delete[0],),
                                     )
+                                    log_cashier_action(
+                                        cur,
+                                        active_cashier_name,
+                                        "Delete Book",
+                                        f"Deleted Book #{book_to_delete[0]} ({book_to_delete[1]})",
+                                    )
                             st.rerun()
                         except psycopg.errors.ForeignKeyViolation:
                             st.error("Cannot delete this book because it has rental or sales history. Delete those records first.")
@@ -1853,7 +2107,13 @@ with tab_customers:
     col_c_add, col_c_edit = st.columns(2)
     with col_c_add:
         with st.expander("+ Add New Customer"):
-            render_add_row_form("customers", "customer_id", "add_customer_form", "Add New Customer")
+            render_add_row_form(
+                "customers",
+                "customer_id",
+                "add_customer_form",
+                "Add New Customer",
+                actor_name=active_cashier_name,
+            )
     with col_c_edit:
         render_edit_row_form(
             "customers",
@@ -1898,6 +2158,12 @@ with tab_customers:
                                         "UPDATE customers SET password_hash = %s WHERE customer_id = %s;",
                                         (hash_password(new_cust_pw), cust_to_reset[0]),
                                     )
+                                    log_cashier_action(
+                                        cur,
+                                        active_cashier_name,
+                                        "Reset Customer Password",
+                                        f"Reset password for {cust_to_reset[1]} (ID #{cust_to_reset[0]})",
+                                    )
                             st.success(f"Password updated for {cust_to_reset[1]}.")
 
         with col_c_del:
@@ -1920,19 +2186,126 @@ with tab_customers:
                                             "DELETE FROM customers WHERE customer_id = %s;",
                                             (customer_to_delete[0],),
                                         )
+                                        log_cashier_action(
+                                            cur,
+                                            active_cashier_name,
+                                            "Delete Customer",
+                                            f"Deleted Customer #{customer_to_delete[0]} ({customer_to_delete[1]})",
+                                        )
                                 st.rerun()
                             except psycopg.errors.ForeignKeyViolation:
                                 st.error("Cannot delete this customer because they have rental or sales records. Delete those records first.")
                             except Exception as e:
                                 st.error(f"Could not delete customer: {e}")
 
+with tab_staff:
+    staff_rows, staff_display = fetch_table(
+        "SELECT staff_id, full_name, username, role, active FROM staff_users ORDER BY staff_id;"
+    )
+    st.dataframe(staff_display, hide_index=True, use_container_width=True)
+
+    if not is_staff_admin:
+        st.info("Log in with an Admin account or the master Store Admin password to add or manage cashiers.")
+    else:
+        col_st_add, col_st_manage = st.columns(2)
+        with col_st_add:
+            with st.expander("+ Create New Cashier / Admin Account", expanded=not staff_rows):
+                with st.form("create_staff_form", clear_on_submit=True):
+                    st_full_name = st.text_input("Staff Full Name", placeholder="e.g. Jane Wanjiku").strip()
+                    st_username = st.text_input("Login Username", placeholder="e.g. jane.w").strip().lower()
+                    st_role = st.selectbox("Access Role", ["Cashier", "Admin"])
+                    st_pass = st.text_input("Initial Password", type="password")
+                    if st.form_submit_button("Create Staff Account", type="primary"):
+                        if not st_full_name or not st_username or len(st_pass) < 4:
+                            st.warning("Provide full name, username, and a password of at least 4 characters.")
+                        elif st_username == "admin":
+                            st.warning("'admin' is reserved for the master password login.")
+                        else:
+                            try:
+                                with psycopg.connect(DB_URL) as conn:
+                                    with conn.cursor() as cur:
+                                        cur.execute(
+                                            """
+                                            INSERT INTO staff_users (full_name, username, role, password_hash, active)
+                                            VALUES (%s, %s, %s, %s, TRUE);
+                                            """,
+                                            (st_full_name, st_username, st_role, hash_password(st_pass)),
+                                        )
+                                        log_cashier_action(
+                                            cur,
+                                            active_cashier_name,
+                                            "Create Staff Account",
+                                            f"Created {st_role} '{st_full_name}' (@{st_username})",
+                                        )
+                                st.success(f"Created {st_role} account for {st_full_name}!")
+                                st.rerun()
+                            except psycopg.errors.UniqueViolation:
+                                st.error("That username already exists. Choose a different username.")
+                            except Exception as e:
+                                st.error(f"Could not create staff account: {e}")
+
+        with col_st_manage:
+            if staff_rows:
+                with st.expander("Reset Password / Suspend Cashier"):
+                    with st.form("manage_staff_form", clear_on_submit=True):
+                        chosen_staff = st.selectbox(
+                            "Select Staff Member",
+                            staff_rows,
+                            format_func=lambda s: f"{s[1]} (@{s[2]}) — {s[3]} [{'Active' if s[4] else 'Suspended'}]",
+                        )
+                        new_st_pw = st.text_input("New Password (leave blank to keep current)", type="password")
+                        new_st_active = st.checkbox("Account Active", value=bool(chosen_staff[4]))
+                        if st.form_submit_button("Update Staff Account"):
+                            with psycopg.connect(DB_URL) as conn:
+                                with conn.cursor() as cur:
+                                    if new_st_pw:
+                                        if len(new_st_pw) < 4:
+                                            st.warning("Password must be at least 4 characters.")
+                                            st.stop()
+                                        cur.execute(
+                                            "UPDATE staff_users SET password_hash = %s, active = %s WHERE staff_id = %s;",
+                                            (hash_password(new_st_pw), new_st_active, chosen_staff[0]),
+                                        )
+                                    else:
+                                        cur.execute(
+                                            "UPDATE staff_users SET active = %s WHERE staff_id = %s;",
+                                            (new_st_active, chosen_staff[0]),
+                                        )
+                                    log_cashier_action(
+                                        cur,
+                                        active_cashier_name,
+                                        "Update Staff Account",
+                                        f"Updated @{chosen_staff[2]} (Active={new_st_active})",
+                                    )
+                            st.success("Staff account updated.")
+                            st.rerun()
+
 with tab_logs:
+    st.markdown("**Cashier & Staff Activity Log**")
+    _, cashier_logs_data = fetch_table(
+        "SELECT activity_id, created_at, cashier_name, action_type, details FROM cashier_activity_logs ORDER BY activity_id DESC;"
+    )
+    st.dataframe(cashier_logs_data, hide_index=True, use_container_width=True)
+    st.download_button(
+        "Download Cashier Activity CSV",
+        data=to_csv_bytes(cashier_logs_data),
+        file_name=f"cashier_activity_logs_{today}.csv",
+        mime="text/csv",
+        disabled=not cashier_logs_data,
+    )
+
+    st.divider()
+    st.markdown("**Database Rental Trigger Logs**")
     _, logs_data = fetch_table("SELECT * FROM rental_logs ORDER BY log_id DESC;")
     st.dataframe(logs_data, hide_index=True, use_container_width=True)
     st.download_button(
-        "Download Audit Logs CSV",
+        "Download Rental Trigger Logs CSV",
         data=to_csv_bytes(logs_data),
         file_name=f"rental_audit_logs_{today}.csv",
         mime="text/csv",
         disabled=not logs_data,
     )
+
+# --- END OF BOOKSTORE CLOUD PORTAL ---
+                
+                    
