@@ -818,7 +818,7 @@ if st.session_state["role"] == "customer":
                             )
                     st.success("Thank you! Your review has been published.")
                     st.rerun()
-      reviews_table = []
+       reviews_table = []
         if all_reviews:
             reviews_table = [
                 {
