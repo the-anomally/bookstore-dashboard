@@ -113,14 +113,28 @@ def get_mpesa_config():
 
 
 def fetch_daraja_token(cfg):
+    if cfg["consumer_key"].startswith("your_") or cfg["consumer_secret"].startswith("your_"):
+        raise ValueError(
+            "Replace the placeholder MPESA_CONSUMER_KEY and MPESA_CONSUMER_SECRET in Streamlit Secrets with your real Daraja app keys."
+        )
     auth_raw = f"{cfg['consumer_key']}:{cfg['consumer_secret']}".encode("utf-8")
     auth_b64 = base64.b64encode(auth_raw).decode("utf-8")
     req = urllib.request.Request(
         f"{cfg['base_url']}/oauth/v1/generate?grant_type=client_credentials",
-        headers={"Authorization": f"Basic {auth_b64}"},
+        headers={
+            "Authorization": f"Basic {auth_b64}",
+            "User-Agent": "BookstoreCloudPortal/1.0",
+            "Accept": "application/json",
+        },
     )
-    with urllib.request.urlopen(req, timeout=12) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as he:
+        body = he.read().decode("utf-8", "replace").strip()
+        raise ValueError(
+            f"OAuth Token HTTP {he.code}: {body or 'Check MPESA_CONSUMER_KEY and MPESA_CONSUMER_SECRET in Streamlit Secrets.'}"
+        )
     token = data.get("access_token")
     if not token:
         raise ValueError("Daraja did not return an access_token.")
@@ -160,6 +174,8 @@ def initiate_mpesa_stk_push(phone_254, amount_kes, account_ref, tx_desc):
             headers={
                 "Authorization": f"Bearer {token}",
                 "Content-Type": "application/json",
+                "User-Agent": "BookstoreCloudPortal/1.0",
+                "Accept": "application/json",
             },
         )
         with urllib.request.urlopen(req, timeout=15) as resp:
@@ -169,10 +185,50 @@ def initiate_mpesa_stk_push(phone_254, amount_kes, account_ref, tx_desc):
         return None, res_body.get("ResponseDescription") or str(res_body)
     except urllib.error.HTTPError as he:
         err_detail = he.read().decode("utf-8", "replace")
-        return None, f"Daraja HTTP {he.code}: {err_detail}"
+        return None, f"STK Push HTTP {he.code}: {err_detail}"
     except Exception as e:
-        return None, f"STK Push error: {e}"
+        return None, str(e)
 
+
+def query_mpesa_stk_status(checkout_request_id):
+    cfg, err = get_mpesa_config()
+    if err:
+        return "ERROR", err
+    try:
+        token = fetch_daraja_token(cfg)
+        password, timestamp = build_daraja_password(cfg["shortcode"], cfg["passkey"])
+        payload = {
+            "BusinessShortCode": cfg["shortcode"],
+            "Password": password,
+            "Timestamp": timestamp,
+            "CheckoutRequestID": checkout_request_id,
+        }
+        req = urllib.request.Request(
+            f"{cfg['base_url']}/mpesa/stkpushquery/v1/query",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+                "User-Agent": "BookstoreCloudPortal/1.0",
+                "Accept": "application/json",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            res_body = json.loads(resp.read().decode("utf-8"))
+        result_code = str(res_body.get("ResultCode", ""))
+        result_desc = res_body.get("ResultDesc", "")
+        if result_code == "0":
+            return "PAID", result_desc or "Payment confirmed by M-Pesa."
+        if result_code:
+            return "FAILED", f"[{result_code}] {result_desc or 'Transaction not completed.'}"
+        return "PENDING", res_body.get("ResponseDescription", "Awaiting customer PIN entry.")
+    except urllib.error.HTTPError as he:
+        err_text = he.read().decode("utf-8", "replace")
+        if "500.001.1001" in err_text or "being processed" in err_text.lower():
+            return "PENDING", "Prompt is still active on customer's phone — waiting for PIN."
+        return "ERROR", f"Daraja Query HTTP {he.code}: {err_text}"
+    except Exception as e:
+        return "ERROR", f"Query error: {e}"
 
 def query_mpesa_stk_status(checkout_request_id):
     cfg, err = get_mpesa_config()
