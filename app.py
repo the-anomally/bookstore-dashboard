@@ -1,5 +1,6 @@
+import base64
 import csv
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from email.message import EmailMessage
 import hashlib
 import hmac
@@ -8,6 +9,7 @@ import json
 import os
 import smtplib
 import ssl
+import urllib.error
 import urllib.parse
 import urllib.request
 import psycopg
@@ -17,6 +19,7 @@ import streamlit as st
 st.set_page_config(page_title="Bookstore Cloud Portal", layout="wide")
 
 DB_URL = st.secrets["DB_URL"]
+EAT_TZ = timezone(timedelta(hours=3))
 
 
 def fetch_table(query, params=None):
@@ -53,6 +56,161 @@ def log_cashier_action(cur, cashier_name, action_type, details):
         """,
         (cashier_name, action_type, details),
     )
+
+
+# --- SAFARICOM DARAJA M-PESA STK PUSH & QUERY HELPERS ---
+def normalize_kenyan_phone(raw_phone):
+    digits = "".join(ch for ch in str(raw_phone or "") if ch.isdigit())
+    if digits.startswith("254") and len(digits) == 12:
+        return digits
+    if digits.startswith("0") and len(digits) == 10:
+        return "254" + digits[1:]
+    if len(digits) == 9 and digits[0] in ("7", "1"):
+        return "254" + digits
+    return None
+
+
+def get_mpesa_config():
+    env = str(st.secrets.get("MPESA_ENV", "sandbox")).strip().lower()
+    base_url = (
+        "https://api.safaricom.co.ke"
+        if env in ("production", "live", "prod")
+        else "https://sandbox.safaricom.co.ke"
+    )
+    consumer_key = st.secrets.get("MPESA_CONSUMER_KEY", "").strip()
+    consumer_secret = st.secrets.get("MPESA_CONSUMER_SECRET", "").strip()
+    shortcode = str(st.secrets.get("MPESA_SHORTCODE", "")).strip()
+    passkey = st.secrets.get("MPESA_PASSKEY", "").strip()
+    tx_type = st.secrets.get("MPESA_TRANSACTION_TYPE", "CustomerPayBillOnline").strip()
+    party_b = str(st.secrets.get("MPESA_PARTY_B", shortcode)).strip()
+    callback_url = st.secrets.get(
+        "MPESA_CALLBACK_URL", "https://bookstore-cloud.streamlit.app/callback"
+    ).strip()
+
+    missing = [
+        name
+        for name, val in [
+            ("MPESA_CONSUMER_KEY", consumer_key),
+            ("MPESA_CONSUMER_SECRET", consumer_secret),
+            ("MPESA_SHORTCODE", shortcode),
+            ("MPESA_PASSKEY", passkey),
+        ]
+        if not val
+    ]
+    if missing:
+        return None, f"Missing M-Pesa secret(s) in Streamlit Secrets: {', '.join(missing)}"
+
+    return {
+        "base_url": base_url,
+        "consumer_key": consumer_key,
+        "consumer_secret": consumer_secret,
+        "shortcode": shortcode,
+        "passkey": passkey,
+        "tx_type": tx_type,
+        "party_b": party_b or shortcode,
+        "callback_url": callback_url,
+    }, None
+
+
+def fetch_daraja_token(cfg):
+    auth_raw = f"{cfg['consumer_key']}:{cfg['consumer_secret']}".encode("utf-8")
+    auth_b64 = base64.b64encode(auth_raw).decode("utf-8")
+    req = urllib.request.Request(
+        f"{cfg['base_url']}/oauth/v1/generate?grant_type=client_credentials",
+        headers={"Authorization": f"Basic {auth_b64}"},
+    )
+    with urllib.request.urlopen(req, timeout=12) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    token = data.get("access_token")
+    if not token:
+        raise ValueError("Daraja did not return an access_token.")
+    return token
+
+
+def build_daraja_password(shortcode, passkey):
+    ts = datetime.now(EAT_TZ).strftime("%Y%m%d%H%M%S")
+    raw = f"{shortcode}{passkey}{ts}".encode("utf-8")
+    return base64.b64encode(raw).decode("utf-8"), ts
+
+
+def initiate_mpesa_stk_push(phone_254, amount_kes, account_ref, tx_desc):
+    cfg, err = get_mpesa_config()
+    if err:
+        return None, err
+    int_amount = max(1, int(round(float(amount_kes))))
+    try:
+        token = fetch_daraja_token(cfg)
+        password, timestamp = build_daraja_password(cfg["shortcode"], cfg["passkey"])
+        payload = {
+            "BusinessShortCode": cfg["shortcode"],
+            "Password": password,
+            "Timestamp": timestamp,
+            "TransactionType": cfg["tx_type"],
+            "Amount": int_amount,
+            "PartyA": phone_254,
+            "PartyB": cfg["party_b"],
+            "PhoneNumber": phone_254,
+            "CallBackURL": cfg["callback_url"],
+            "AccountReference": str(account_ref)[:12] or "Bookstore",
+            "TransactionDesc": str(tx_desc)[:13] or "Book Sale",
+        }
+        req = urllib.request.Request(
+            f"{cfg['base_url']}/mpesa/stkpush/v1/processrequest",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            res_body = json.loads(resp.read().decode("utf-8"))
+        if str(res_body.get("ResponseCode")) == "0":
+            return res_body, None
+        return None, res_body.get("ResponseDescription") or str(res_body)
+    except urllib.error.HTTPError as he:
+        err_detail = he.read().decode("utf-8", "replace")
+        return None, f"Daraja HTTP {he.code}: {err_detail}"
+    except Exception as e:
+        return None, f"STK Push error: {e}"
+
+
+def query_mpesa_stk_status(checkout_request_id):
+    cfg, err = get_mpesa_config()
+    if err:
+        return "ERROR", err
+    try:
+        token = fetch_daraja_token(cfg)
+        password, timestamp = build_daraja_password(cfg["shortcode"], cfg["passkey"])
+        payload = {
+            "BusinessShortCode": cfg["shortcode"],
+            "Password": password,
+            "Timestamp": timestamp,
+            "CheckoutRequestID": checkout_request_id,
+        }
+        req = urllib.request.Request(
+            f"{cfg['base_url']}/mpesa/stkpushquery/v1/query",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            res_body = json.loads(resp.read().decode("utf-8"))
+        result_code = str(res_body.get("ResultCode", ""))
+        result_desc = res_body.get("ResultDesc", "")
+        if result_code == "0":
+            return "PAID", result_desc or "Payment confirmed by M-Pesa."
+        if result_code:
+            return "FAILED", f"[{result_code}] {result_desc or 'Transaction not completed.'}"
+        return "PENDING", res_body.get("ResponseDescription", "Awaiting customer PIN entry.")
+    except urllib.error.HTTPError as he:
+        err_text = he.read().decode("utf-8", "replace")
+        if "500.001.1001" in err_text or "being processed" in err_text.lower():
+            return "PENDING", "Prompt is still active on customer's phone — waiting for PIN."
+        return "ERROR", f"Daraja Query HTTP {he.code}: {err_text}"
+    except Exception as e:
+        return "ERROR", f"Query error: {e}"
 
 
 # --- PASSWORD HASHING HELPERS (STAFF CASHIERS & CUSTOMERS) ---
@@ -255,7 +413,7 @@ def send_sms_reminder(phone_number, message_text):
         return False, f"SMS failed: {e}"
 
 
-# Ensure schema extensions, cashier accounts, activity logs, sales, reviews, and settings exist
+# Ensure schema extensions, STK push tracking, cashier accounts, sales, reviews, and settings exist
 with psycopg.connect(DB_URL) as conn:
     with conn.cursor() as cur:
         cur.execute("ALTER TABLE rentals ADD COLUMN IF NOT EXISTS return_date DATE;")
@@ -313,6 +471,26 @@ with psycopg.connect(DB_URL) as conn:
         cur.execute("ALTER TABLE sales ADD COLUMN IF NOT EXISTS sold_by TEXT;")
         cur.execute(
             """
+            CREATE TABLE IF NOT EXISTS mpesa_stk_requests (
+                stk_id SERIAL PRIMARY KEY,
+                checkout_request_id TEXT UNIQUE NOT NULL,
+                merchant_request_id TEXT,
+                phone_number TEXT NOT NULL,
+                amount NUMERIC(10, 2) NOT NULL,
+                book_id INTEGER NOT NULL REFERENCES books(book_id),
+                customer_id INTEGER REFERENCES customers(customer_id),
+                quantity INTEGER NOT NULL DEFAULT 1,
+                unit_price NUMERIC(10, 2) NOT NULL,
+                status TEXT NOT NULL DEFAULT 'Pending',
+                result_desc TEXT,
+                sale_id INTEGER,
+                created_by TEXT,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        )
+        cur.execute(
+            """
             CREATE TABLE IF NOT EXISTS reservations (
                 reservation_id SERIAL PRIMARY KEY,
                 book_id INTEGER NOT NULL REFERENCES books(book_id),
@@ -355,6 +533,93 @@ with psycopg.connect(DB_URL) as conn:
             ON CONFLICT (id) DO NOTHING;
             """
         )
+
+
+def finalize_stk_sale(stk_row, actor_name, curr_code, book_lookup, customer_lookup):
+    """Confirms Daraja STK payment and converts the pending STK record into a completed sale."""
+    stk_id = stk_row["stk_id"]
+    checkout_id = stk_row["checkout_request_id"]
+    book_id = stk_row["book_id"]
+    customer_id = stk_row.get("customer_id")
+    qty = int(stk_row["quantity"])
+    unit_price = float(stk_row["unit_price"])
+    total_paid = float(stk_row["amount"])
+    today_dt = date.today()
+
+    with psycopg.connect(DB_URL) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT status, sale_id FROM mpesa_stk_requests WHERE stk_id = %s FOR UPDATE;",
+                (stk_id,),
+            )
+            current_rec = cur.fetchone()
+            if current_rec and current_rec[0] == "Completed" and current_rec[1]:
+                return True, current_rec[1], "Sale was already recorded."
+
+            cur.execute(
+                "UPDATE books SET stock = stock - %s WHERE book_id = %s AND stock >= %s RETURNING stock;",
+                (qty, book_id, qty),
+            )
+            if cur.fetchone() is None:
+                return False, None, "Payment received, but book stock ran out. Restock and record manually."
+
+            cur.execute(
+                """
+                INSERT INTO sales (
+                    book_id, customer_id, quantity, unit_price, total_amount,
+                    payment_method, payment_ref, sale_date, sold_by
+                )
+                VALUES (%s, %s, %s, %s, %s, 'M-Pesa STK', %s, %s, %s)
+                RETURNING sale_id;
+                """,
+                (
+                    book_id,
+                    customer_id,
+                    qty,
+                    unit_price,
+                    total_paid,
+                    checkout_id,
+                    today_dt,
+                    actor_name,
+                ),
+            )
+            new_sale_id = cur.fetchone()[0]
+            cur.execute(
+                """
+                UPDATE mpesa_stk_requests
+                SET status = 'Completed', sale_id = %s, result_desc = 'Confirmed via STK Query'
+                WHERE stk_id = %s;
+                """,
+                (new_sale_id, stk_id),
+            )
+            b_title = book_lookup.get(book_id, f"Book #{book_id}")
+            log_cashier_action(
+                cur,
+                actor_name,
+                "M-Pesa STK Sale",
+                f"Sale #{new_sale_id}: '{b_title}' x{qty} = {curr_code} {total_paid:,.2f} (Ref: {checkout_id})",
+            )
+
+    b_title = book_lookup.get(book_id, f"Book #{book_id}")
+    c_name = customer_lookup.get(customer_id, "Walk-in Customer") if customer_id else "Walk-in Customer"
+    st.session_state["last_receipt"] = {
+        "receipt_no": f"SAL-{new_sale_id}",
+        "type": "Sale",
+        "issued_date": str(today_dt),
+        "served_by": actor_name,
+        "record_id": new_sale_id,
+        "customer_id": customer_id,
+        "customer_name": c_name,
+        "book_id": book_id,
+        "book_title": b_title,
+        "quantity": qty,
+        "unit_price": unit_price,
+        "total_amount": total_paid,
+        "payment_method": "M-Pesa STK",
+        "payment_ref": checkout_id,
+        "currency": curr_code,
+    }
+    return True, new_sale_id, "M-Pesa payment confirmed and sale recorded!"
 
 
 def get_editable_columns(table_name, id_col):
@@ -466,6 +731,7 @@ def require_login():
 
     st.title("Bookstore Cloud Portal")
     tab_staff_login, tab_cust_login = st.tabs(["Staff & Cashier Login", "Customer Login"])
+
     with tab_staff_login:
         with st.form("staff_login_form"):
             cashier_username = st.text_input(
@@ -667,6 +933,14 @@ all_reviews, _ = fetch_table(
     ORDER BY review_id DESC;
     """
 )
+_, pending_stk_rows = fetch_table(
+    """
+    SELECT *
+    FROM mpesa_stk_requests
+    WHERE status = 'Pending'
+    ORDER BY stk_id DESC;
+    """
+)
 
 book_names = {r[0]: r[1] for r in book_rows}
 customer_names = {r[0]: r[1] for r in customer_rows}
@@ -838,7 +1112,7 @@ if st.session_state["role"] == "customer":
                     "Status": format_rental_status(r[4], r[5]),
                     f"Late Fee ({currency})": f"{calculate_late_fee(r[4], r[5], daily_late_fee):,.2f}",
                 }
-                for r in my_rentals
+        for r in my_rentals
             ]
             st.dataframe(my_table, hide_index=True, use_container_width=True)
         else:
@@ -1134,6 +1408,61 @@ m6.metric("Pending Pickups", len(pending_reservations))
 m7.metric("Active Late Fees", f"{currency} {total_active_late_fees:,.2f}")
 m8.metric("Retail Revenue", f"{currency} {total_sales_revenue:,.2f}")
 
+# --- ACTIVE M-PESA STK PUSH CONFIRMATION BANNER ---
+if pending_stk_rows:
+    st.info(f"**M-Pesa STK Push Awaiting Customer PIN ({len(pending_stk_rows)} pending):**")
+    for stk_item in pending_stk_rows:
+        stk_book_title = book_names.get(stk_item["book_id"], f"Book #{stk_item['book_id']}")
+        with st.container(border=True):
+            c_stk_info, c_stk_check, c_stk_cancel = st.columns([4, 2, 1])
+            with c_stk_info:
+                st.markdown(
+                    f"**{stk_book_title}** (x{stk_item['quantity']}) — "
+                    f"**{currency} {float(stk_item['amount']):,.2f}** sent to **`{stk_item['phone_number']}`**"
+                )
+                st.caption(f"CheckoutRequestID: `{stk_item['checkout_request_id']}`")
+            with c_stk_check:
+                if st.button(
+                    "Confirm Payment & Print Receipt",
+                    key=f"verify_stk_{stk_item['stk_id']}",
+                    type="primary",
+                ):
+                    q_status, q_msg = query_mpesa_stk_status(stk_item["checkout_request_id"])
+                    if q_status == "PAID":
+                        ok_sale, _, sale_msg = finalize_stk_sale(
+                            stk_item,
+                            active_cashier_name,
+                            currency,
+                            book_names,
+                            customer_names,
+                        )
+                        if ok_sale:
+                            st.rerun()
+                        else:
+                            st.error(sale_msg)
+                    elif q_status == "PENDING":
+                        st.warning(q_msg)
+                    elif q_status == "FAILED":
+                        with psycopg.connect(DB_URL) as conn:
+                            with conn.cursor() as cur:
+                                cur.execute(
+                                    "UPDATE mpesa_stk_requests SET status = 'Failed', result_desc = %s WHERE stk_id = %s;",
+                                    (q_msg, stk_item["stk_id"]),
+                                )
+                        st.error(f"M-Pesa declined or cancelled: {q_msg}")
+                        st.rerun()
+                    else:
+                        st.error(q_msg)
+            with c_stk_cancel:
+                if st.button("Cancel", key=f"cancel_stk_{stk_item['stk_id']}"):
+                    with psycopg.connect(DB_URL) as conn:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                "UPDATE mpesa_stk_requests SET status = 'Cancelled', result_desc = 'Dismissed by cashier' WHERE stk_id = %s;",
+                                (stk_item["stk_id"],),
+                            )
+                    st.rerun()
+
 # --- PRINTABLE PDF RECEIPT BANNER (AFTER SALE, CHECKOUT, OR RETURN) ---
 if st.session_state.get("last_receipt"):
     rec = st.session_state["last_receipt"]
@@ -1217,7 +1546,7 @@ if pending_reservations:
                                 "type": "Checkout",
                                 "issued_date": str(today),
                                 "served_by": active_cashier_name,
-                                "record_id": new_rid,
+                                 "record_id": new_rid,
                                 "customer_id": selected_res[2],
                                 "customer_name": customer_names.get(selected_res[2], f"Customer #{selected_res[2]}"),
                                 "book_id": selected_res[1],
@@ -1398,11 +1727,15 @@ with col_pos:
             )
             pay_method = st.selectbox(
                 "Payment Method",
-                ["M-Pesa", "Cash", "Card", "Bank Transfer"],
+                ["M-Pesa STK Push", "M-Pesa (Manual Code)", "Cash", "Card", "Bank Transfer"],
             )
+            stk_phone_input = st.text_input(
+                "Customer M-Pesa Phone (for STK Push)",
+                placeholder="e.g. 0712345678 (leave blank to use customer's saved phone)",
+            ).strip()
             pay_ref = st.text_input(
-                "Payment Ref / M-Pesa Code (Optional)",
-                placeholder="e.g. QK789XYZ or Cash",
+                "Manual Payment Ref (for Manual M-Pesa / Card)",
+                placeholder="e.g. QK789XYZ",
             ).strip()
             custom_unit_price = st.number_input(
                 f"Custom Unit Price ({currency}, 0 = catalog price)",
@@ -1410,69 +1743,128 @@ with col_pos:
                 step=50.0,
                 value=0.0,
             )
-            if st.form_submit_button("Complete Sale", type="primary"):
+            if st.form_submit_button("Send M-Pesa Prompt / Complete Sale", type="primary"):
                 book_id = sale_book[1]["book_id"]
+                avail_stock = int(sale_book[1].get("stock", 0))
                 catalog_price = float(sale_book[1].get("selling_price", 0))
                 final_unit_price = custom_unit_price if custom_unit_price > 0 else catalog_price
                 total_paid = round(final_unit_price * int(sale_qty), 2)
                 buyer_id = sale_buyer[0] if sale_buyer is not None else None
                 buyer_name = sale_buyer[1] if sale_buyer is not None else "Walk-in Customer"
 
-                with psycopg.connect(DB_URL) as conn:
-                    with conn.cursor() as cur:
-                        cur.execute(
-                            "UPDATE books SET stock = stock - %s WHERE book_id = %s AND stock >= %s RETURNING stock;",
-                            (int(sale_qty), book_id, int(sale_qty)),
+                if int(sale_qty) > avail_stock:
+                    st.error(f"Only {avail_stock} copy/copies in stock.")
+                elif pay_method == "M-Pesa STK Push":
+                    raw_phone = stk_phone_input or (
+                        customer_contacts.get(buyer_id, {}).get("phone") if buyer_id else ""
+                    )
+                    norm_phone = normalize_kenyan_phone(raw_phone)
+                    if not norm_phone:
+                        st.error(
+                            "Enter a valid Kenyan phone number (e.g. 0712345678 or 254712345678) for M-Pesa STK Push."
                         )
-                        if cur.fetchone() is None:
-                            st.error("Insufficient stock available for that quantity.")
+                    elif total_paid < 1:
+                        st.error("Book price must be at least KES 1 to send an M-Pesa STK prompt.")
+                    else:
+                        stk_resp, stk_err = initiate_mpesa_stk_push(
+                            norm_phone,
+                            total_paid,
+                            account_ref=f"BK{book_id}",
+                            tx_desc="Book Purchase",
+                        )
+                        if stk_err:
+                            st.error(f"Could not trigger M-Pesa prompt: {stk_err}")
                         else:
-                            cur.execute(
-                                """
-                                INSERT INTO sales (
-                                    book_id, customer_id, quantity, unit_price, total_amount,
-                                    payment_method, payment_ref, sale_date, sold_by
-                                )
-                                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                                RETURNING sale_id;
-                                """,
-                                (
-                                    book_id,
-                                    buyer_id,
-                                    int(sale_qty),
-                                    final_unit_price,
-                                    total_paid,
-                                    pay_method,
-                                    pay_ref or None,
-                                    today,
-                                    active_cashier_name,
-                                ),
-                            )
-                            new_sale_id = cur.fetchone()[0]
-                            log_cashier_action(
-                                cur,
-                                active_cashier_name,
-                                "Retail Sale",
-                                f"Sale #{new_sale_id}: '{sale_book[0][1]}' x{int(sale_qty)} = {currency} {total_paid:,.2f} ({pay_method})",
-                            )
-                            st.session_state["last_receipt"] = {
-                                "receipt_no": f"SAL-{new_sale_id}",
-                                "type": "Sale",
-                                "issued_date": str(today),
-                                "served_by": active_cashier_name,
-                                "record_id": new_sale_id,
-                                "customer_id": buyer_id,
-                                "customer_name": buyer_name,
-                                "book_id": book_id,
-                                "book_title": sale_book[0][1],
-                                "quantity": int(sale_qty),
-                                "unit_price": final_unit_price,
-                                "total_amount": total_paid,
-                                "payment_method": pay_method,
-                                "payment_ref": pay_ref or None,
-                                "currency": currency,
-                            }
+                            checkout_id = stk_resp["CheckoutRequestID"]
+                            merchant_id = stk_resp.get("MerchantRequestID", "")
+                            with psycopg.connect(DB_URL) as conn:
+                                with conn.cursor() as cur:
+                                    cur.execute(
+                                        """
+                                        INSERT INTO mpesa_stk_requests (
+                                            checkout_request_id, merchant_request_id, phone_number, amount,
+                                            book_id, customer_id, quantity, unit_price, status, created_by
+                                        )
+                                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'Pending', %s);
+                                        """,
+                                        (
+                                            checkout_id,
+                                            merchant_id,
+                                            norm_phone,
+                                            total_paid,
+                                            book_id,
+                                            buyer_id,
+                                            int(sale_qty),
+                                            final_unit_price,
+                                            active_cashier_name,
+                                        ),
+                                    )
+                                    log_cashier_action(
+                                        cur,
+                                        active_cashier_name,
+                                        "Send M-Pesa STK",
+                                        f"Sent {currency} {total_paid:,.2f} prompt to {norm_phone} for '{sale_book[0][1]}'",
+                                    )
                             st.rerun()
+                else:
+                    recorded_method = (
+                        "M-Pesa" if pay_method == "M-Pesa (Manual Code)" else pay_method
+                    )
+                    with psycopg.connect(DB_URL) as conn:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                "UPDATE books SET stock = stock - %s WHERE book_id = %s AND stock >= %s RETURNING stock;",
+                                (int(sale_qty), book_id, int(sale_qty)),
+                            )
+                            if cur.fetchone() is None:
+                                st.error("Insufficient stock available for that quantity.")
+                            else:
+                                cur.execute(
+                                    """
+                                    INSERT INTO sales (
+                                        book_id, customer_id, quantity, unit_price, total_amount,
+                                        payment_method, payment_ref, sale_date, sold_by
+                                    )
+                                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                    RETURNING sale_id;
+                                    """,
+                                    (
+                                        book_id,
+                                        buyer_id,
+                                        int(sale_qty),
+                                        final_unit_price,
+                                        total_paid,
+                                        recorded_method,
+                                        pay_ref or None,
+                                        today,
+                                        active_cashier_name,
+                                    ),
+                                )
+                                new_sale_id = cur.fetchone()[0]
+                                log_cashier_action(
+                                    cur,
+                                    active_cashier_name,
+                                    "Retail Sale",
+                                    f"Sale #{new_sale_id}: '{sale_book[0][1]}' x{int(sale_qty)} = {currency} {total_paid:,.2f} ({recorded_method})",
+                                )
+                                st.session_state["last_receipt"] = {
+                                    "receipt_no": f"SAL-{new_sale_id}",
+                                    "type": "Sale",
+                                    "issued_date": str(today),
+                                    "served_by": active_cashier_name,
+                                    "record_id": new_sale_id,
+                                    "customer_id": buyer_id,
+                                    "customer_name": buyer_name,
+                                    "book_id": book_id,
+                                    "book_title": sale_book[0][1],
+                                    "quantity": int(sale_qty),
+                                    "unit_price": final_unit_price,
+                                    "total_amount": total_paid,
+                                    "payment_method": recorded_method,
+                                    "payment_ref": pay_ref or None,
+                                    "currency": currency,
+                                }
+                                st.rerun()
     else:
         st.warning("No books in stock to sell.")
 
@@ -1518,7 +1910,7 @@ if is_staff_admin:
             with st.form("reset_demo_data_form", clear_on_submit=True):
                 st.markdown("**Pre-Launch Test Data Reset**")
                 st.caption(
-                    "Clears test rentals, sales, reservations, reviews, and audit logs "
+                    "Clears test rentals, sales, M-Pesa STK requests, reservations, reviews, and audit logs "
                     "while keeping your books, staff cashiers, and customer accounts."
                 )
                 confirm_reset_box = st.checkbox("Confirm clearing all test transaction history")
@@ -1534,6 +1926,7 @@ if is_staff_admin:
                                 cur.execute("DELETE FROM rental_logs;")
                                 cur.execute("DELETE FROM rentals;")
                                 cur.execute("DELETE FROM sales;")
+                                cur.execute("DELETE FROM mpesa_stk_requests;")
                                 cur.execute("DELETE FROM reservations;")
                                 cur.execute("DELETE FROM reviews;")
                                 cur.execute("DELETE FROM cashier_activity_logs;")
@@ -1706,7 +2099,9 @@ with tab_rentals:
 
 with tab_sales:
     todays_sales_total = sum(float(s[5]) for s in all_sales if s[8] == today)
-    mpesa_total = sum(float(s[5]) for s in all_sales if s[6] == "M-Pesa")
+    mpesa_total = sum(
+        float(s[5]) for s in all_sales if str(s[6]).startswith("M-Pesa")
+    )
     cash_total = sum(float(s[5]) for s in all_sales if s[6] == "Cash")
     units_sold = sum(int(s[3]) for s in all_sales)
 
@@ -1754,6 +2149,18 @@ with tab_sales:
         mime="text/csv",
         disabled=not filtered_sales,
     )
+
+    _, all_stk_history = fetch_table(
+        """
+        SELECT stk_id, created_at, phone_number, amount, status, checkout_request_id, result_desc, sale_id, created_by
+        FROM mpesa_stk_requests
+        ORDER BY stk_id DESC
+        LIMIT 50;
+        """
+    )
+    if all_stk_history:
+        with st.expander("M-Pesa STK Push Request Log"):
+            st.dataframe(all_stk_history, hide_index=True, use_container_width=True)
 
     if all_sales:
         col_s_pdf, col_s_del = st.columns(2)
@@ -2307,5 +2714,3 @@ with tab_logs:
     )
 
 # --- END OF BOOKSTORE CLOUD PORTAL ---
-                
-                    
