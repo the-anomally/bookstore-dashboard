@@ -81,7 +81,7 @@ def get_mpesa_config():
     consumer_secret = st.secrets.get("MPESA_CONSUMER_SECRET", "").strip()
     shortcode = str(st.secrets.get("MPESA_SHORTCODE", "")).strip()
     passkey = st.secrets.get("MPESA_PASSKEY", "").strip()
-tx_type = st.secrets.get("MPESA_TRANSACTION_TYPE", "CustomerPayBillOnline").strip()
+    tx_type = st.secrets.get("MPESA_TRANSACTION_TYPE", "CustomerPayBillOnline").strip()
     party_b = str(st.secrets.get("MPESA_PARTY_B", shortcode)).strip()
     account_ref = str(st.secrets.get("MPESA_ACCOUNT_REF", "")).strip()
     callback_url = st.secrets.get(
