@@ -81,8 +81,9 @@ def get_mpesa_config():
     consumer_secret = st.secrets.get("MPESA_CONSUMER_SECRET", "").strip()
     shortcode = str(st.secrets.get("MPESA_SHORTCODE", "")).strip()
     passkey = st.secrets.get("MPESA_PASSKEY", "").strip()
-    tx_type = st.secrets.get("MPESA_TRANSACTION_TYPE", "CustomerPayBillOnline").strip()
+tx_type = st.secrets.get("MPESA_TRANSACTION_TYPE", "CustomerPayBillOnline").strip()
     party_b = str(st.secrets.get("MPESA_PARTY_B", shortcode)).strip()
+    account_ref = str(st.secrets.get("MPESA_ACCOUNT_REF", "")).strip()
     callback_url = st.secrets.get(
         "MPESA_CALLBACK_URL", "https://bookstore-cloud.streamlit.app/callback"
     ).strip()
@@ -108,9 +109,9 @@ def get_mpesa_config():
         "passkey": passkey,
         "tx_type": tx_type,
         "party_b": party_b or shortcode,
+        "account_ref": account_ref,
         "callback_url": callback_url,
     }, None
-
 
 def fetch_daraja_token(cfg):
     if cfg["consumer_key"].startswith("your_") or cfg["consumer_secret"].startswith("your_"):
